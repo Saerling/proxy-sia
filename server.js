@@ -57,7 +57,11 @@ async function loginToSia() {
         withCredentials: true,
         maxRedirects: 10,
         validateStatus: () => true, // manejamos nosotros los códigos, no queremos que axios lance error en 3xx/4xx
-        headers: { 'User-Agent': UA }
+        headers: {
+            'User-Agent': UA,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7'
+        }
     }));
 
     // Paso 1: pedir el recurso protegido sin sesión. Esto dispara toda la cadena de
@@ -80,7 +84,7 @@ async function loginToSia() {
     // Señal de éxito: terminamos dentro de ServiciosApp (no de vuelta en la página de login)
     const ok = finalUrl.includes('/ServiciosApp') && loginRes.status < 400;
 
-    return { ok, client, jar, finalUrl, htmlPreview: html.slice(0, 300) };
+    return { ok, client, jar, finalUrl, status: loginRes.status, htmlPreview: html.slice(0, 3000) };
 }
 
 async function getSiaSession() {
@@ -103,6 +107,7 @@ app.get('/api/sia-directo/debug-login', async (req, res) => {
         const result = await loginToSia();
         res.json({
             ok: result.ok,
+            status: result.status,
             finalUrl: result.finalUrl,
             htmlPreview: result.htmlPreview
         });

@@ -86,11 +86,12 @@ async function loginToSia() {
 
     const finalUrl = (loginRes.request && loginRes.request.res && loginRes.request.res.responseUrl) || '';
     const html = typeof loginRes.data === 'string' ? loginRes.data : '';
+    const responseHeaders = loginRes.headers || {};
 
     // Señal de éxito: terminamos dentro de ServiciosApp (no de vuelta en la página de login)
     const ok = finalUrl.includes('/ServiciosApp') && loginRes.status < 400;
 
-    return { ok, client, jar, finalUrl, status: loginRes.status, htmlPreview: html.slice(0, 3000) };
+    return { ok, client, jar, finalUrl, status: loginRes.status, htmlPreview: html.slice(0, 3000), responseHeaders };
 }
 
 async function getSiaSession() {
@@ -115,6 +116,7 @@ app.get('/api/sia-directo/debug-login', async (req, res) => {
             ok: result.ok,
             status: result.status,
             finalUrl: result.finalUrl,
+            responseHeaders: result.responseHeaders,
             htmlPreview: result.htmlPreview
         });
     } catch (err) {

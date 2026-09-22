@@ -235,7 +235,14 @@ async function fetchCourseDataDebug(session) {
 
     function record(name, res) {
         const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-        steps.push({ name, status: res.status, preview: body.slice(0, 400) });
+        const vsIdx = body.indexOf('ViewState');
+        steps.push({
+            name,
+            status: res.status,
+            length: body.length,
+            preview: body.slice(0, 400),
+            viewStateContext: vsIdx !== -1 ? body.slice(Math.max(0, vsIdx - 60), vsIdx + 150) : null
+        });
         return body;
     }
 

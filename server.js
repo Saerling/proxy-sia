@@ -172,5 +172,147 @@ app.get('/api/sia-directo/debug-login', async (req, res) => {
     }
 });
 
+// ==========================================
+// NAVEGAR HASTA "ASIGNATURAS DISPONIBLES PARA CURSAR" Y LEER LA TABLA DE CUPOS
+// ==========================================
+function randomWindowId() {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let id = '';
+    for (let i = 0; i < 10; i++) id += chars[Math.floor(Math.random() * chars.length)];
+    return id;
+}
+
+function extractViewState(html) {
+    const m = html.match(/name="javax\.faces\.ViewState"[^>]*value="([^"]*)"/);
+    return m ? m[1] : null;
+}
+
+const HTML_ENTITY_MAP = {
+    aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú', ntilde: 'ñ',
+    Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú', Ntilde: 'Ñ',
+    amp: '&', lt: '<', gt: '>', nbsp: ' ', quot: '"'
+};
+function decodeHtmlEntities(str) {
+    return str.replace(/&(\w+);/g, (m, name) => (name in HTML_ENTITY_MAP ? HTML_ENTITY_MAP[name] : m));
+}
+
+// Extrae la tabla real de materias/cupos del HTML incrustado en la respuesta PPR
+// (confirmado con datos reales: cada fila trae nombre+código, tipología, créditos y cupos).
+function parseCoursesFromXml(xml) {
+    const rows = [];
+    const rowRegex = /<tr role="row" _afrRK="\d+" class="af_table_data-row">([\s\S]*?)<\/tr>/g;
+    let rowMatch;
+    while ((rowMatch = rowRegex.exec(xml)) !== null) {
+        const rowHtml = rowMatch[1];
+        const spanRegex = /<span[^>]*>([^<]*)<\/span>/g;
+        const spans = [];
+        let m;
+        while ((m = spanRegex.exec(rowHtml)) !== null) spans.push(decodeHtmlEntities(m[1]));
+        if (spans.length >= 4) {
+            const nameCode = spans[0];
+            const nm = nameCode.match(/^(.*)\s\(([^)]+)\)\s*$/);
+            rows.push({
+                name: nm ? nm[1].trim() : nameCode,
+                code: nm ? nm[2].trim() : '',
+                typology: spans[1],
+                credits: spans[2],
+                available: spans[3]
+            });
+        }
+    }
+    return rows;
+}
+
+// Replica paso a paso la navegación real capturada en el HAR: cargar la página,
+// abrir el menú, entrar a "Asignaturas disponibles para cursar", fijar los filtros
+// (mismos valores por defecto de la cuenta: plan/periodo/tipo ya vienen preseleccionados)
+// y hacer clic en "Mostrar". Cada paso queda registrado en `steps` para depurar si algo falla.
+async function fetchCourseDataDebug(session) {
+    const { jar } = session;
+    const windowId = randomWindowId();
+    const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
+    const steps = [];
+
+    function record(name, res) {
+        const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+        steps.push({ name, status: res.status, preview: body.slice(0, 400) });
+        return body;
+    }
+
+    const pageUrl = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=0&Adf-Window-Id=${windowId}&_afrPage=0&_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0`;
+    const pageRes = await http2Request(jar, 'GET', pageUrl);
+    const pageHtml = record('1-cargar-pagina', pageRes);
+    const viewState = extractViewState(pageHtml);
+    steps[steps.length - 1].viewStateEncontrado = !!viewState;
+    if (!viewState) return { ok: false, steps };
+
+    const baseUrl = `https://sia.unal.edu.co/ServiciosApp/faces/inicioServicios?Adf-Window-Id=${windowId}&Adf-Page-Id=0`;
+
+    async function pprPost(name, formFields) {
+        const body = new URLSearchParams({
+            'org.apache.myfaces.trinidad.faces.FORM': 'f1',
+            'Adf-Window-Id': windowId,
+            'javax.faces.ViewState': viewState,
+            'Adf-Page-Id': '0',
+            ...formFields
+        }).toString();
+        const res = await http2Request(jar, 'POST', baseUrl, body, { 'Content-Type': 'application/x-www-form-urlencoded' });
+        return record(name, res);
+    }
+
+    await pprPost('2-expandir-menu', {
+        event: 'pt1:men-portlets:j_idt25',
+        'event.pt1:men-portlets:j_idt25': '<m xmlns="http://oracle.com/richClient/comm"><k v="expand"><b>1</b></k><k v="type"><s>disclosure</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:men-portlets:j_idt25'
+    });
+
+    await pprPost('3-clic-asignaturas-disponibles', {
+        event: 'pt1:men-portlets:j_idt29',
+        'event.pt1:men-portlets:j_idt29': '<m xmlns="http://oracle.com/richClient/comm"><k v="type"><s>action</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'f1,pt1:men-portlets:j_idt29'
+    });
+
+    await pprPost('4-seleccionar-periodo', {
+        'pt1:r1:1:soc3': '0', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
+        event: 'pt1:r1:1:soc3',
+        'event.pt1:r1:1:soc3': '<m xmlns="http://oracle.com/richClient/comm"><k v="autoSubmit"><b>1</b></k><k v="suppressMessageShow"><s>true</s></k><k v="type"><s>valueChange</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:r1:1:soc3'
+    });
+
+    await pprPost('5-seleccionar-plan', {
+        'pt1:r1:1:soc3': '0', 'pt1:r1:1:soc2': '0', 'pt1:r1:1:soc4': '', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
+        event: 'pt1:r1:1:soc2',
+        'event.pt1:r1:1:soc2': '<m xmlns="http://oracle.com/richClient/comm"><k v="autoSubmit"><b>1</b></k><k v="suppressMessageShow"><s>true</s></k><k v="type"><s>valueChange</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:r1:1:soc2'
+    });
+
+    await pprPost('6-seleccionar-tipo', {
+        'pt1:r1:1:soc3': '0', 'pt1:r1:1:soc2': '0', 'pt1:r1:1:soc4': '0', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
+        event: 'pt1:r1:1:soc4',
+        'event.pt1:r1:1:soc4': '<m xmlns="http://oracle.com/richClient/comm"><k v="autoSubmit"><b>1</b></k><k v="suppressMessageShow"><s>true</s></k><k v="type"><s>valueChange</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:r1:1:soc4'
+    });
+
+    const finalHtml = await pprPost('7-clic-mostrar', {
+        'pt1:r1:1:soc3': '0', 'pt1:r1:1:soc2': '0', 'pt1:r1:1:soc4': '0', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
+        event: 'pt1:r1:1:pt_cb1',
+        'event.pt1:r1:1:pt_cb1': '<m xmlns="http://oracle.com/richClient/comm"><k v="type"><s>action</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:r1,pt1:r1:1:pt_cb1'
+    });
+
+    const courses = parseCoursesFromXml(finalHtml);
+    return { ok: true, steps, courses, coursesCount: courses.length };
+}
+
+app.get('/api/sia-directo/cupos-debug', async (req, res) => {
+    try {
+        const session = await getSiaSession();
+        const result = await fetchCourseDataDebug(session);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ error: String(err.message || err) });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy listo en http://localhost:${PORT}`));

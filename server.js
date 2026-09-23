@@ -13,10 +13,8 @@ app.get('/', (req, res) => {
 
 // ==========================================
 // PROXY VIEJO HACIA sia.gabotachak.dev
-// (lo dejamos tal cual, por si ese servicio se recupera más adelante)
 // ==========================================
 const SIA_UPSTREAM = 'https://sia.gabotachak.dev';
-
 app.use('/api/sia', async (req, res) => {
     const upstreamUrl = SIA_UPSTREAM + req.url;
     try {
@@ -31,13 +29,12 @@ app.use('/api/sia', async (req, res) => {
 });
 
 // ==========================================
-// LOGIN DIRECTO CONTRA EL SIA REAL (Oracle Access Manager), sobre HTTP/2
+// LOGIN DIRECTO CONTRA EL SIA REAL
 // ==========================================
 const SIA_USER = process.env.SIA_USERNAME;
 const SIA_PASS = process.env.SIA_PASSWORD;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36';
 
-// Cabeceras "de huella de navegador" que vimos en la captura real (HAR) exitosa.
 function browserHeaders() {
     return {
         'User-Agent': UA,
@@ -52,8 +49,6 @@ function browserHeaders() {
     };
 }
 
-// Una sola petición HTTP/2, inyectando y capturando cookies a mano en el jar
-// (no usamos axios-cookiejar-support: preferimos control total y explícito).
 async function http2Request(jar, method, url, data, extraHeaders = {}) {
     const cookieHeader = await jar.getCookieString(url);
     const headers = {
@@ -61,37 +56,30 @@ async function http2Request(jar, method, url, data, extraHeaders = {}) {
         ...(cookieHeader ? { Cookie: cookieHeader } : {}),
         ...extraHeaders
     };
-
     const res = await axios({
         method,
         url,
         data,
         headers,
         httpVersion: 2,
-        maxRedirects: 0,          // las redirecciones las seguimos nosotros abajo
-        validateStatus: () => true // nunca lanzar excepción por 3xx/4xx/5xx; las inspeccionamos
+        maxRedirects: 0,
+        validateStatus: () => true
     });
-
     const setCookieHeaders = res.headers['set-cookie'];
     if (setCookieHeaders) {
         for (const sc of setCookieHeaders) {
-            try { await jar.setCookie(sc, url); } catch (e) { /* cookie no aplicable a este dominio/path, se ignora */ }
+            try { await jar.setCookie(sc, url); } catch (e) {}
         }
     }
-
     return res;
 }
 
-// Sigue manualmente la cadena de redirecciones 3xx (como haría un navegador),
-// preservando el jar de cookies entre cada salto.
 async function requestFollowingRedirects(jar, method, url, data, extraHeaders = {}, maxHops = 15) {
     let currentUrl = url;
     let currentMethod = method;
     let currentData = data;
-
     for (let hop = 0; hop < maxHops; hop++) {
         const res = await http2Request(jar, currentMethod, currentUrl, currentData, hop === 0 ? extraHeaders : {});
-
         if (res.status >= 300 && res.status < 400 && res.headers.location) {
             currentUrl = new URL(res.headers.location, currentUrl).toString();
             if (currentMethod !== 'GET') {
@@ -100,10 +88,8 @@ async function requestFollowingRedirects(jar, method, url, data, extraHeaders = 
             }
             continue;
         }
-
         return { res, finalUrl: currentUrl };
     }
-
     throw new Error(`Demasiadas redirecciones (más de ${maxHops}) sin llegar a una respuesta final.`);
 }
 
@@ -111,15 +97,8 @@ async function loginToSia() {
     if (!SIA_USER || !SIA_PASS) {
         throw new Error('Faltan las variables de entorno SIA_USERNAME / SIA_PASSWORD en Railway.');
     }
-
     const jar = new CookieJar();
-
-    // Paso 1: pedir el recurso protegido sin sesión -> dispara la cadena de redirecciones
-    // hasta el login de OAM, dejando las cookies iniciales puestas en el jar.
     await requestFollowingRedirects(jar, 'GET', 'https://sia.unal.edu.co/ServiciosApp');
-
-    // Paso 2: enviar usuario y clave, siguiendo manualmente TODA la cadena de
-    // redirecciones resultante.
     const { res: finalRes, finalUrl } = await requestFollowingRedirects(
         jar,
         'POST',
@@ -127,10 +106,8 @@ async function loginToSia() {
         new URLSearchParams({ username: SIA_USER, password: SIA_PASS, submit: 'Iniciar Sesión' }).toString(),
         { 'Content-Type': 'application/x-www-form-urlencoded' }
     );
-
     const html = typeof finalRes.data === 'string' ? finalRes.data : JSON.stringify(finalRes.data);
     const ok = finalUrl.includes('/ServiciosApp') && finalRes.status < 400;
-
     return {
         ok,
         jar,
@@ -173,7 +150,7 @@ app.get('/api/sia-directo/debug-login', async (req, res) => {
 });
 
 // ==========================================
-// NAVEGAR HASTA "ASIGNATURAS DISPONIBLES PARA CURSAR" Y LEER LA TABLA DE CUPOS
+// AUXILIARES Y RUTA DE CUPOS DEBUG
 // ==========================================
 function randomWindowId() {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -192,12 +169,11 @@ const HTML_ENTITY_MAP = {
     Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú', Ntilde: 'Ñ',
     amp: '&', lt: '<', gt: '>', nbsp: ' ', quot: '"'
 };
+
 function decodeHtmlEntities(str) {
     return str.replace(/&(\w+);/g, (m, name) => (name in HTML_ENTITY_MAP ? HTML_ENTITY_MAP[name] : m));
 }
 
-// Extrae la tabla real de materias/cupos del HTML incrustado en la respuesta PPR
-// (confirmado con datos reales: cada fila trae nombre+código, tipología, créditos y cupos).
 function parseCoursesFromXml(xml) {
     const rows = [];
     const rowRegex = /<tr role="row" _afrRK="\d+" class="af_table_data-row">([\s\S]*?)<\/tr>/g;
@@ -223,8 +199,6 @@ function parseCoursesFromXml(xml) {
     return rows;
 }
 
-// Parsea los argumentos de AdfLoopbackUtils.runLoopback(...) de la página puente,
-// respetando el literal de objeto {..} que contiene comas propias.
 function parseLoopbackArgs(scriptText) {
     const m = scriptText.match(/AdfLoopbackUtils\.runLoopback\(([\s\S]*?)\);/);
     if (!m) return null;
@@ -245,29 +219,21 @@ function parseLoopbackArgs(scriptText) {
         else { current += c; }
     }
     if (current.trim()) tokens.push(current.trim());
-
     const unquote = (t) => (t && t.startsWith("'") && t.endsWith("'")) ? t.slice(1, -1) : t;
     if (tokens.length < 8) return null;
-    return { windowId: unquote(tokens[7]) }; // 8º argumento (k): el window id que asigna el servidor
+    return { windowId: unquote(tokens[7]) };
 }
 
-// Sigue el "loopback" de cookies de ADF: la página puente redirige a sí misma
-// alternando _afrWindowMode entre 0 y 2, usando el window id que el propio
-// servidor asigna (no el que nosotros inventamos al principio). Confirmado con
-// datos reales: hacen falta 2-3 vueltas antes de recibir la página real con ViewState.
-// Sigue el "loopback" de cookies de ADF: extrae cookies de prueba JS y el windowId asignado.
 async function loadRealPage(jar, steps) {
     const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
     let windowId = randomWindowId();
     let windowMode = 0;
     const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
-
     for (let attempt = 1; attempt <= 5; attempt++) {
         const url = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=${windowMode}&Adf-Window-Id=${windowId}&_afrPage=0&${mediaParams}`;
         const res = await http2Request(jar, 'GET', url);
         const body = typeof res.data === 'string' ? res.data : '';
         const viewState = extractViewState(body);
-
         steps.push({
             name: `1.${attempt}-cargar-pagina(windowMode=${windowMode})`,
             status: res.status,
@@ -276,35 +242,18 @@ async function loadRealPage(jar, steps) {
             viewStateEncontrado: !!viewState,
             preview: body.length <= 2000 ? body : body.slice(0, 800)
         });
-
         if (viewState) return { viewState, windowId };
-
-        // Extraer cookie de loopback si el script JS la inyecta
-        const cookieMatch = body.match(/_addCookie\("([^"]+)",\s*"([^"]*)"\)/);
-        if (cookieMatch) {
-            const [, cName, cVal] = cookieMatch;
-            try {
-                await jar.setCookie(`${cName}=${cVal}; Path=/; Domain=sia.unal.edu.co`, 'https://sia.unal.edu.co');
-            } catch (e) { /* Ignorar error de asignación de cookie */ }
-        }
-
         const parsed = parseLoopbackArgs(body);
         if (!parsed) return { viewState: null, windowId };
-
         windowId = parsed.windowId;
         windowMode = windowMode === 0 ? 2 : 0;
     }
     return { viewState: null, windowId };
 }
 
-// Replica paso a paso la navegación real capturada en el HAR: cargar la página,
-// abrir el menú, entrar a "Asignaturas disponibles para cursar", fijar los filtros
-// (mismos valores por defecto de la cuenta: plan/periodo/tipo ya vienen preseleccionados)
-// y hacer clic en "Mostrar". Cada paso queda registrado en `steps` para depurar si algo falla.
 async function fetchCourseDataDebug(session) {
     const { jar } = session;
     const steps = [];
-
     function record(name, res) {
         const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
         const vsIdx = body.indexOf('ViewState');
@@ -317,12 +266,9 @@ async function fetchCourseDataDebug(session) {
         });
         return body;
     }
-
     const { viewState, windowId } = await loadRealPage(jar, steps);
     if (!viewState) return { ok: false, steps };
-
     const baseUrl = `https://sia.unal.edu.co/ServiciosApp/faces/inicioServicios?Adf-Window-Id=${windowId}&Adf-Page-Id=0`;
-
     async function pprPost(name, formFields) {
         const body = new URLSearchParams({
             'org.apache.myfaces.trinidad.faces.FORM': 'f1',
@@ -334,47 +280,40 @@ async function fetchCourseDataDebug(session) {
         const res = await http2Request(jar, 'POST', baseUrl, body, { 'Content-Type': 'application/x-www-form-urlencoded' });
         return record(name, res);
     }
-
     await pprPost('2-expandir-menu', {
         event: 'pt1:men-portlets:j_idt25',
         'event.pt1:men-portlets:j_idt25': '<m xmlns="http://oracle.com/richClient/comm"><k v="expand"><b>1</b></k><k v="type"><s>disclosure</s></k></m>',
         'oracle.adf.view.rich.PROCESS': 'pt1:men-portlets:j_idt25'
     });
-
     await pprPost('3-clic-asignaturas-disponibles', {
         event: 'pt1:men-portlets:j_idt29',
         'event.pt1:men-portlets:j_idt29': '<m xmlns="http://oracle.com/richClient/comm"><k v="type"><s>action</s></k></m>',
         'oracle.adf.view.rich.PROCESS': 'f1,pt1:men-portlets:j_idt29'
     });
-
     await pprPost('4-seleccionar-periodo', {
         'pt1:r1:1:soc3': '0', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
         event: 'pt1:r1:1:soc3',
         'event.pt1:r1:1:soc3': '<m xmlns="http://oracle.com/richClient/comm"><k v="autoSubmit"><b>1</b></k><k v="suppressMessageShow"><s>true</s></k><k v="type"><s>valueChange</s></k></m>',
         'oracle.adf.view.rich.PROCESS': 'pt1:r1:1:soc3'
     });
-
     await pprPost('5-seleccionar-plan', {
         'pt1:r1:1:soc3': '0', 'pt1:r1:1:soc2': '0', 'pt1:r1:1:soc4': '', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
         event: 'pt1:r1:1:soc2',
         'event.pt1:r1:1:soc2': '<m xmlns="http://oracle.com/richClient/comm"><k v="autoSubmit"><b>1</b></k><k v="suppressMessageShow"><s>true</s></k><k v="type"><s>valueChange</s></k></m>',
         'oracle.adf.view.rich.PROCESS': 'pt1:r1:1:soc2'
     });
-
     await pprPost('6-seleccionar-tipo', {
         'pt1:r1:1:soc3': '0', 'pt1:r1:1:soc2': '0', 'pt1:r1:1:soc4': '0', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
         event: 'pt1:r1:1:soc4',
         'event.pt1:r1:1:soc4': '<m xmlns="http://oracle.com/richClient/comm"><k v="autoSubmit"><b>1</b></k><k v="suppressMessageShow"><s>true</s></k><k v="type"><s>valueChange</s></k></m>',
         'oracle.adf.view.rich.PROCESS': 'pt1:r1:1:soc4'
     });
-
     const finalHtml = await pprPost('7-clic-mostrar', {
         'pt1:r1:1:soc3': '0', 'pt1:r1:1:soc2': '0', 'pt1:r1:1:soc4': '0', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
         event: 'pt1:r1:1:pt_cb1',
         'event.pt1:r1:1:pt_cb1': '<m xmlns="http://oracle.com/richClient/comm"><k v="type"><s>action</s></k></m>',
         'oracle.adf.view.rich.PROCESS': 'pt1:r1,pt1:r1:1:pt_cb1'
     });
-
     const courses = parseCoursesFromXml(finalHtml);
     return { ok: true, steps, courses, coursesCount: courses.length };
 }

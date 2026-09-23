@@ -240,15 +240,21 @@ async function fetchCourseDataDebug(session) {
             name,
             status: res.status,
             length: body.length,
-            preview: body.slice(0, 400),
+            preview: body.length <= 8000 ? body : body.slice(0, 400),
             viewStateContext: vsIdx !== -1 ? body.slice(Math.max(0, vsIdx - 60), vsIdx + 150) : null
         });
         return body;
     }
 
     const pageUrl = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=0&Adf-Window-Id=${windowId}&_afrPage=0&_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0`;
+    // Primer golpe: normalmente devuelve la página de "loopback" (AdfLoopbackUtils),
+    // que en un navegador real ejecutaría JS y recargaría la misma URL. Replicamos
+    // ese segundo golpe manualmente.
+    const loopbackRes = await http2Request(jar, 'GET', pageUrl);
+    record('1a-loopback', loopbackRes);
+
     const pageRes = await http2Request(jar, 'GET', pageUrl);
-    const pageHtml = record('1-cargar-pagina', pageRes);
+    const pageHtml = record('1b-cargar-pagina-real', pageRes);
     const viewState = extractViewState(pageHtml);
     steps[steps.length - 1].viewStateEncontrado = !!viewState;
     if (!viewState) return { ok: false, steps };

@@ -50,6 +50,7 @@ function browserHeaders() {
     };
 }
 
+// Remplazo seguro de http2Request usando axios plano (con soporte de cookies del jar)
 async function http2Request(jar, method, url, data, extraHeaders = {}) {
     const cookieHeader = await jar.getCookieString(url);
     const headers = {
@@ -57,15 +58,17 @@ async function http2Request(jar, method, url, data, extraHeaders = {}) {
         ...(cookieHeader ? { Cookie: cookieHeader } : {}),
         ...extraHeaders
     };
+    
+    // Asignamos explícitamente el User-Agent y cabeceras exactas de navegador
     const res = await axios({
         method,
         url,
         data,
         headers,
-        httpVersion: 2,
         maxRedirects: 0,
         validateStatus: () => true
     });
+
     const setCookieHeaders = res.headers['set-cookie'];
     if (setCookieHeaders) {
         for (const sc of setCookieHeaders) {
@@ -226,16 +229,23 @@ function parseLoopbackArgs(scriptText) {
     return { windowId: unquote(tokens[7]) };
 }
 
+// Carga la página resolviendo las cookies de loopback simulando lo que hace el JS de Oracle ADF
 async function loadRealPage(jar, steps) {
     const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
     let windowId = randomWindowId();
     let windowMode = 0;
-    const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
-    for (let attempt = 1; attempt <= 5; attempt++) {
+    
+    for (let attempt = 1; attempt <= 6; attempt++) {
+        const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
+        
+        // Simular la cookie que inyecta AdfLoopbackUtils._addCookie
+        await jar.setCookie(`_afrLoop=${afrLoop}; path=/ServiciosApp`, 'https://sia.unal.edu.co');
+        
         const url = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=${windowMode}&Adf-Window-Id=${windowId}&_afrPage=0&${mediaParams}`;
         const res = await http2Request(jar, 'GET', url);
         const body = typeof res.data === 'string' ? res.data : '';
         const viewState = extractViewState(body);
+
         steps.push({
             name: `1.${attempt}-cargar-pagina(windowMode=${windowMode})`,
             status: res.status,
@@ -244,10 +254,13 @@ async function loadRealPage(jar, steps) {
             viewStateEncontrado: !!viewState,
             preview: body.length <= 2000 ? body : body.slice(0, 800)
         });
+
         if (viewState) return { viewState, windowId };
+
         const parsed = parseLoopbackArgs(body);
-        if (!parsed) return { viewState: null, windowId };
-        windowId = parsed.windowId;
+        if (parsed && parsed.windowId) {
+            windowId = parsed.windowId;
+        }
         windowMode = windowMode === 0 ? 2 : 0;
     }
     return { viewState: null, windowId };

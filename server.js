@@ -374,9 +374,9 @@ app.get('/api/sia-directo/cupos-debug', async (req, res) => {
     try {
         const session = await getSiaSession();
         const result = await fetchCourseDataDebug(session);
-        res.json(result);
+        res.json({ generatedAt: new Date().toISOString(), ...result });
     } catch (err) {
-        res.status(500).json({ error: String(err.message || err) });
+        res.status(500).json({ generatedAt: new Date().toISOString(), error: String(err.message || err) });
     }
 });
 

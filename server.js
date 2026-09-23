@@ -78,20 +78,23 @@ async function loginToSia() {
     return { ok, client, jar, finalUrl, status: loginRes.status, htmlPreview: html.slice(0, 1000) };
 }
 
+// Remplaza únicamente la función loadRealPage y fetchCourseDataDebug dentro de server.js
+
 async function loadRealPage(jar, steps) {
-    const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
+    const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDW=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
     let windowId = randomWindowId();
-    let windowMode = 0;
+    const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
+
+    // Inyectamos la cookie que el script AdfLoopbackUtils intentaba guardar mediante JS
+    try {
+        await jar.setCookie(`Adf-Window-Id=${windowId}; path=/`, 'https://sia.unal.edu.co');
+    } catch (e) {}
 
     for (let attempt = 1; attempt <= 5; attempt++) {
-        const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
+        // En ADF, forzar _afrWindowMode=0 tras setear las cookies evita el loopback
+        const windowMode = attempt === 1 ? 2 : 0;
         const url = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=${windowMode}&Adf-Window-Id=${windowId}&_afrPage=0&${mediaParams}`;
         
-        // Simular la cookie que ADF espera tras la ejecución del script puente
-        try {
-            await jar.setCookie(`_afrLoop=${afrLoop}; path=/; domain=sia.unal.edu.co`, 'https://sia.unal.edu.co');
-        } catch (e) {}
-
         const res = await http2Request(jar, 'GET', url);
         const body = typeof res.data === 'string' ? res.data : '';
         const viewState = extractViewState(body);
@@ -108,34 +111,14 @@ async function loadRealPage(jar, steps) {
         if (viewState) return { viewState, windowId };
 
         const parsed = parseLoopbackArgs(body);
-        if (!parsed) return { viewState: null, windowId };
-
-        windowId = parsed.windowId;
-        windowMode = windowMode === 0 ? 2 : 0;
-    }
-
-    return { viewState: null, windowId };
-}
-
-let siaSession = null;
-const SESSION_MAX_AGE_MS = 10 * 60 * 1000;
-
-async function getSiaSession() {
-    const stale = !siaSession || (Date.now() - siaSession.loggedInAt) > SESSION_MAX_AGE_MS;
-    if (stale) {
-        const result = await loginToSia();
-        if (!result.ok) {
-            siaSession = null;
-            throw new Error('Login al SIA falló. finalUrl=' + result.finalUrl + ' status=' + result.status);
+        if (parsed && parsed.windowId) {
+            windowId = parsed.windowId;
+            try {
+                await jar.setCookie(`Adf-Window-Id=${windowId}; path=/`, 'https://sia.unal.edu.co');
+            } catch (e) {}
         }
-        siaSession = { client: result.client, loggedInAt: Date.now() };
     }
-    return siaSession;
-}
-
-function extractViewState(html) {
-    const m = html.match(/name="javax\.faces\.ViewState"[^>]*value="([^"]*)"/);
-    return m ? m[1] : null;
+    return { viewState: null, windowId };
 }
 
 const HTML_ENTITY_MAP = {

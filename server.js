@@ -255,6 +255,7 @@ function parseLoopbackArgs(scriptText) {
 // alternando _afrWindowMode entre 0 y 2, usando el window id que el propio
 // servidor asigna (no el que nosotros inventamos al principio). Confirmado con
 // datos reales: hacen falta 2-3 vueltas antes de recibir la página real con ViewState.
+// Sigue el "loopback" de cookies de ADF: extrae cookies de prueba JS y el windowId asignado.
 async function loadRealPage(jar, steps) {
     const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
     let windowId = randomWindowId();
@@ -278,13 +279,21 @@ async function loadRealPage(jar, steps) {
 
         if (viewState) return { viewState, windowId };
 
+        // Extraer cookie de loopback si el script JS la inyecta
+        const cookieMatch = body.match(/_addCookie\("([^"]+)",\s*"([^"]*)"\)/);
+        if (cookieMatch) {
+            const [, cName, cVal] = cookieMatch;
+            try {
+                await jar.setCookie(`${cName}=${cVal}; Path=/; Domain=sia.unal.edu.co`, 'https://sia.unal.edu.co');
+            } catch (e) { /* Ignorar error de asignación de cookie */ }
+        }
+
         const parsed = parseLoopbackArgs(body);
-        if (!parsed) return { viewState: null, windowId }; // ni loopback ni ViewState: algo inesperado
+        if (!parsed) return { viewState: null, windowId };
 
         windowId = parsed.windowId;
         windowMode = windowMode === 0 ? 2 : 0;
     }
-
     return { viewState: null, windowId };
 }
 

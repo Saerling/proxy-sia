@@ -12,9 +12,10 @@ app.get('/', (req, res) => {
 });
 
 // ==========================================
-// PROXY HACIA SIA.GABOTACHAK.DEV
+// PROXY VIEJO HACIA sia.gabotachak.dev
 // ==========================================
 const SIA_UPSTREAM = 'https://sia.gabotachak.dev';
+
 app.use('/api/sia', async (req, res) => {
     const upstreamUrl = SIA_UPSTREAM + req.url;
     try {
@@ -29,7 +30,7 @@ app.use('/api/sia', async (req, res) => {
 });
 
 // ==========================================
-// LOGIN DIRECTO CONTRA EL SIA REAL
+// LOGIN DIRECTO CONTRA EL SIA REAL (Oracle Access Manager), sobre HTTP/2
 // ==========================================
 const SIA_USER = process.env.SIA_USERNAME;
 const SIA_PASS = process.env.SIA_PASSWORD;
@@ -38,7 +39,7 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 function browserHeaders() {
     return {
         'User-Agent': UA,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7',
         'Upgrade-Insecure-Requests': '1',
         'Cache-Control': 'max-age=0',
@@ -90,7 +91,114 @@ async function requestFollowingRedirects(jar, method, url, data, extraHeaders = 
         }
         return { res, finalUrl: currentUrl };
     }
-    throw new Error(`Demasiadas redirecciones (más de ${maxHops}).`);
+    throw new Error(`Demasiadas redirecciones (más de ${maxHops}) sin llegar a una respuesta final.`);
+}
+
+async function loginToSia() {
+    if (!SIA_USER || !SIA_PASS) {
+        throw new Error('Faltan las variables de entorno SIA_USERNAME / SIA_PASSWORD en Railway.');
+    }
+    const jar = new CookieJar();
+    await requestFollowingRedirects(jar, 'GET', 'https://sia.unal.edu.co/ServiciosApp');
+    
+    const { res: finalRes, finalUrl } = await requestFollowingRedirects(
+        jar,
+        'POST',
+        'https://autenticasia.unal.edu.co/oam/server/auth_cred_submit',
+        new URLSearchParams({ username: SIA_USER, password: SIA_PASS, submit: 'Iniciar Sesión' }).toString(),
+        { 'Content-Type': 'application/x-www-form-urlencoded' }
+    );
+    const html = typeof finalRes.data === 'string' ? finalRes.data : JSON.stringify(finalRes.data);
+    const ok = finalUrl.includes('/ServiciosApp') && finalRes.status < 400;
+    return {
+        ok,
+        jar,
+        finalUrl,
+        status: finalRes.status,
+        htmlPreview: html.slice(0, 3000),
+        responseHeaders: finalRes.headers
+    };
+}
+
+let siaSession = null;
+const SESSION_MAX_AGE_MS = 10 * 60 * 1000;
+
+async function getSiaSession() {
+    const stale = !siaSession || (Date.now() - siaSession.loggedInAt) > SESSION_MAX_AGE_MS;
+    if (stale) {
+        const result = await loginToSia();
+        if (!result.ok) {
+            siaSession = null;
+            throw new Error('Login al SIA falló. finalUrl=' + result.finalUrl + ' status=' + result.status);
+        }
+        siaSession = { jar: result.jar, loggedInAt: Date.now() };
+    }
+    return siaSession;
+}
+
+app.get('/api/sia-directo/debug-login', async (req, res) => {
+    try {
+        const result = await loginToSia();
+        res.json({
+            ok: result.ok,
+            status: result.status,
+            finalUrl: result.finalUrl,
+            responseHeaders: result.responseHeaders,
+            htmlPreview: result.htmlPreview
+        });
+    } catch (err) {
+        res.status(500).json({ error: String(err.message || err) });
+    }
+});
+
+// ==========================================
+// NAVEGAR HASTA "ASIGNATURAS DISPONIBLES PARA CURSAR" Y LEER LA TABLA DE CUPOS
+// ==========================================
+function randomWindowId() {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let id = '';
+    for (let i = 0; i < 10; i++) id += chars[Math.floor(Math.random() * chars.length)];
+    return id;
+}
+
+function extractViewState(html) {
+    const m = html.match(/name="javax\.faces\.ViewState"[^>]*value="([^"]*)"/);
+    return m ? m[1] : null;
+}
+
+const HTML_ENTITY_MAP = {
+    aacute: 'á', eacute: 'é', iacute: 'í', oacute: 'ó', uacute: 'ú', ntilde: 'ñ',
+    Aacute: 'Á', Eacute: 'É', Iacute: 'Í', Oacute: 'Ó', Uacute: 'Ú', Ntilde: 'Ñ',
+    amp: '&', lt: '<', gt: '>', nbsp: ' ', quot: '"'
+};
+
+function decodeHtmlEntities(str) {
+    return str.replace(/&(\w+);/g, (m, name) => (name in HTML_ENTITY_MAP ? HTML_ENTITY_MAP[name] : m));
+}
+
+function parseCoursesFromXml(xml) {
+    const rows = [];
+    const rowRegex = /<tr role="row" _afrRK="\d+" class="af_table_data-row">([\s\S]*?)<\/tr>/g;
+    let rowMatch;
+    while ((rowMatch = rowRegex.exec(xml)) !== null) {
+        const rowHtml = rowMatch[1];
+        const spanRegex = /<span[^>]*>([^<]*)<\/span>/g;
+        const spans = [];
+        let m;
+        while ((m = spanRegex.exec(rowHtml)) !== null) spans.push(decodeHtmlEntities(m[1]));
+        if (spans.length >= 4) {
+            const nameCode = spans[0];
+            const nm = nameCode.match(/^(.*)\s\(([^)]+)\)\s*$/);
+            rows.push({
+                name: nm ? nm[1].trim() : nameCode,
+                code: nm ? nm[2].trim() : '',
+                typology: spans[1],
+                credits: spans[2],
+                available: spans[3]
+            });
+        }
+    }
+    return rows;
 }
 
 function parseLoopbackArgs(scriptText) {
@@ -118,111 +226,105 @@ function parseLoopbackArgs(scriptText) {
     return { windowId: unquote(tokens[7]) };
 }
 
-function extractViewState(html) {
-    const m = html.match(/name="javax\.faces\.ViewState"[^>]*value="([^"]*)"/);
-    return m ? m[1] : null;
-}
-
-async function resolveAdfLoopback(jar, initialHtml) {
-    let body = initialHtml;
+async function loadRealPage(jar, steps) {
+    const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
+    let windowId = randomWindowId();
     let windowMode = 0;
+    const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
     for (let attempt = 1; attempt <= 5; attempt++) {
-        const viewState = extractViewState(body);
-        if (viewState) return { viewState, body };
-
-        const parsed = parseLoopbackArgs(body);
-        if (!parsed) break;
-
-        const windowId = parsed.windowId;
-        const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
-        const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
         const url = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=${windowMode}&Adf-Window-Id=${windowId}&_afrPage=0&${mediaParams}`;
-        
         const res = await http2Request(jar, 'GET', url);
-        body = typeof res.data === 'string' ? res.data : '';
+        const body = typeof res.data === 'string' ? res.data : '';
+        const viewState = extractViewState(body);
+        steps.push({
+            name: `1.${attempt}-cargar-pagina(windowMode=${windowMode})`,
+            status: res.status,
+            length: body.length,
+            isLoopback: body.includes('AdfLoopbackUtils.runLoopback'),
+            viewStateEncontrado: !!viewState,
+            preview: body.length <= 2000 ? body : body.slice(0, 800)
+        });
+        if (viewState) return { viewState, windowId };
+        const parsed = parseLoopbackArgs(body);
+        if (!parsed) return { viewState: null, windowId };
+        windowId = parsed.windowId;
         windowMode = windowMode === 0 ? 2 : 0;
     }
-    return { viewState: null, body };
+    return { viewState: null, windowId };
 }
 
-async function loginToSia() {
-    if (!SIA_USER || !SIA_PASS) {
-        throw new Error('Faltan las variables de entorno SIA_USERNAME / SIA_PASSWORD en Railway.');
-    }
-    const jar = new CookieJar();
-
-    // Paso 1: Obtener cookies e identificar el OAM_REQ_INFO del formulario
-    const step1 = await requestFollowingRedirects(jar, 'GET', 'https://sia.unal.edu.co/ServiciosApp');
-    const firstHtml = typeof step1.res.data === 'string' ? step1.res.data : '';
-    
-    const reqInfoMatch = firstHtml.match(/name="request_id"\s+value="([^"]+)"/);
-    const requestId = reqInfoMatch ? reqInfoMatch[1] : '';
-
-    // Paso 2: Enviar credenciales
-    const formData = new URLSearchParams({
-        username: SIA_USER,
-        password: SIA_PASS,
-        submit: 'Iniciar Sesión'
-    });
-    if (requestId) formData.append('request_id', requestId);
-
-    const step2 = await requestFollowingRedirects(
-        jar,
-        'POST',
-        'https://autenticasia.unal.edu.co/oam/server/auth_cred_submit',
-        formData.toString(),
-        { 
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'Referer': step1.finalUrl
-        }
-    );
-
-    const rawHtml = typeof step2.res.data === 'string' ? step2.res.data : JSON.stringify(step2.res.data);
-    
-    // Paso 3: Resolver Loopback de ADF
-    const { viewState, body: finalHtml } = await resolveAdfLoopback(jar, rawHtml);
-
-    const ok = step2.finalUrl.includes('/ServiciosApp') && !!viewState;
-
-    return {
-        ok,
-        jar,
-        finalUrl: step2.finalUrl,
-        status: step2.res.status,
-        hasViewState: !!viewState,
-        htmlPreview: finalHtml.slice(0, 3000),
-        responseHeaders: step2.res.headers
-    };
-}
-
-let siaSession = null;
-const SESSION_MAX_AGE_MS = 10 * 60 * 1000;
-
-async function getSiaSession() {
-    const stale = !siaSession || (Date.now() - siaSession.loggedInAt) > SESSION_MAX_AGE_MS;
-    if (stale) {
-        const result = await loginToSia();
-        if (!result.ok) {
-            siaSession = null;
-            throw new Error('Login al SIA falló. finalUrl=' + result.finalUrl + ' status=' + result.status);
-        }
-        siaSession = { jar: result.jar, loggedInAt: Date.now() };
-    }
-    return siaSession;
-}
-
-app.get('/api/sia-directo/debug-login', async (req, res) => {
-    try {
-        const result = await loginToSia();
-        res.json({
-            generatedAt: new Date().toISOString(),
-            ok: result.ok,
-            status: result.status,
-            finalUrl: result.finalUrl,
-            hasViewState: result.hasViewState,
-            responseHeaders: result.responseHeaders,
-            htmlPreview: result.htmlPreview
+async function fetchCourseDataDebug(session) {
+    const { jar } = session;
+    const steps = [];
+    function record(name, res) {
+        const body = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+        const vsIdx = body.indexOf('ViewState');
+        steps.push({
+            name,
+            status: res.status,
+            length: body.length,
+            preview: body.length <= 8000 ? body : body.slice(0, 400),
+            viewStateContext: vsIdx !== -1 ? body.slice(Math.max(0, vsIdx - 60), vsIdx + 150) : null
         });
+        return body;
+    }
+    const { viewState, windowId } = await loadRealPage(jar, steps);
+    if (!viewState) return { ok: false, steps };
+    const baseUrl = `https://sia.unal.edu.co/ServiciosApp/faces/inicioServicios?Adf-Window-Id=${windowId}&Adf-Page-Id=0`;
+    async function pprPost(name, formFields) {
+        const body = new URLSearchParams({
+            'org.apache.myfaces.trinidad.faces.FORM': 'f1',
+            'Adf-Window-Id': windowId,
+            'javax.faces.ViewState': viewState,
+            'Adf-Page-Id': '0',
+            ...formFields
+        }).toString();
+        const res = await http2Request(jar, 'POST', baseUrl, body, { 'Content-Type': 'application/x-www-form-urlencoded' });
+        return record(name, res);
+    }
+    await pprPost('2-expandir-menu', {
+        event: 'pt1:men-portlets:j_idt25',
+        'event.pt1:men-portlets:j_idt25': '<m xmlns="http://oracle.com/richClient/comm"><k v="expand"><b>1</b></k><k v="type"><s>disclosure</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:men-portlets:j_idt25'
+    });
+    await pprPost('3-clic-asignaturas-disponibles', {
+        event: 'pt1:men-portlets:j_idt29',
+        'event.pt1:men-portlets:j_idt29': '<m xmlns="http://oracle.com/richClient/comm"><k v="type"><s>action</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'f1,pt1:men-portlets:j_idt29'
+    });
+    await pprPost('4-seleccionar-periodo', {
+        'pt1:r1:1:soc3': '0', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
+        event: 'pt1:r1:1:soc3',
+        'event.pt1:r1:1:soc3': '<m xmlns="http://oracle.com/richClient/comm"><k v="autoSubmit"><b>1</b></k><k v="suppressMessageShow"><s>true</s></k><k v="type"><s>valueChange</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:r1:1:soc3'
+    });
+    await pprPost('5-seleccionar-plan', {
+        'pt1:r1:1:soc3': '0', 'pt1:r1:1:soc2': '0', 'pt1:r1:1:soc4': '', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
+        event: 'pt1:r1:1:soc2',
+        'event.pt1:r1:1:soc2': '<m xmlns="http://oracle.com/richClient/comm"><k v="autoSubmit"><b>1</b></k><k v="suppressMessageShow"><s>true</s></k><k v="type"><s>valueChange</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:r1:1:soc2'
+    });
+    await pprPost('6-seleccionar-tipo', {
+        'pt1:r1:1:soc3': '0', 'pt1:r1:1:soc2': '0', 'pt1:r1:1:soc4': '0', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
+        event: 'pt1:r1:1:soc4',
+        'event.pt1:r1:1:soc4': '<m xmlns="http://oracle.com/richClient/comm"><k v="autoSubmit"><b>1</b></k><k v="suppressMessageShow"><s>true</s></k><k v="type"><s>valueChange</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:r1:1:soc4'
+    });
+    const finalHtml = await pprPost('7-clic-mostrar', {
+        'pt1:r1:1:soc3': '0', 'pt1:r1:1:soc2': '0', 'pt1:r1:1:soc4': '0', 'pt1:r1:1:descPlanLibreId': '', 'pt1:r1:1:soc1': '',
+        event: 'pt1:r1:1:pt_cb1',
+        'event.pt1:r1:1:pt_cb1': '<m xmlns="http://oracle.com/richClient/comm"><k v="type"><s>action</s></k></m>',
+        'oracle.adf.view.rich.PROCESS': 'pt1:r1,pt1:r1:1:pt_cb1'
+    });
+    const courses = parseCoursesFromXml(finalHtml);
+    return { ok: true, steps, courses, coursesCount: courses.length };
+}
+
+app.get('/api/sia-directo/cupos-debug', async (req, res) => {
+    try {
+        const session = await getSiaSession();
+        const result = await fetchCourseDataDebug(session);
+        res.json({ generatedAt: new Date().toISOString(), ...result });
     } catch (err) {
         res.status(500).json({ generatedAt: new Date().toISOString(), error: String(err.message || err) });
     }

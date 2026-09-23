@@ -223,14 +223,77 @@ function parseCoursesFromXml(xml) {
     return rows;
 }
 
+// Parsea los argumentos de AdfLoopbackUtils.runLoopback(...) de la página puente,
+// respetando el literal de objeto {..} que contiene comas propias.
+function parseLoopbackArgs(scriptText) {
+    const m = scriptText.match(/AdfLoopbackUtils\.runLoopback\(([\s\S]*?)\);/);
+    if (!m) return null;
+    const argsStr = m[1];
+    const tokens = [];
+    let depth = 0, inString = false, current = '';
+    for (let i = 0; i < argsStr.length; i++) {
+        const c = argsStr[i];
+        if (inString) {
+            current += c;
+            if (c === "'" && argsStr[i - 1] !== '\\') inString = false;
+        } else if (c === "'") {
+            inString = true;
+            current += c;
+        } else if (c === '{') { depth++; current += c; }
+        else if (c === '}') { depth--; current += c; }
+        else if (c === ',' && depth === 0) { tokens.push(current.trim()); current = ''; }
+        else { current += c; }
+    }
+    if (current.trim()) tokens.push(current.trim());
+
+    const unquote = (t) => (t && t.startsWith("'") && t.endsWith("'")) ? t.slice(1, -1) : t;
+    if (tokens.length < 8) return null;
+    return { windowId: unquote(tokens[7]) }; // 8º argumento (k): el window id que asigna el servidor
+}
+
+// Sigue el "loopback" de cookies de ADF: la página puente redirige a sí misma
+// alternando _afrWindowMode entre 0 y 2, usando el window id que el propio
+// servidor asigna (no el que nosotros inventamos al principio). Confirmado con
+// datos reales: hacen falta 2-3 vueltas antes de recibir la página real con ViewState.
+async function loadRealPage(jar, steps) {
+    const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
+    let windowId = randomWindowId();
+    let windowMode = 0;
+    const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
+
+    for (let attempt = 1; attempt <= 5; attempt++) {
+        const url = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=${windowMode}&Adf-Window-Id=${windowId}&_afrPage=0&${mediaParams}`;
+        const res = await http2Request(jar, 'GET', url);
+        const body = typeof res.data === 'string' ? res.data : '';
+        const viewState = extractViewState(body);
+
+        steps.push({
+            name: `1.${attempt}-cargar-pagina(windowMode=${windowMode})`,
+            status: res.status,
+            length: body.length,
+            isLoopback: body.includes('AdfLoopbackUtils.runLoopback'),
+            viewStateEncontrado: !!viewState,
+            preview: body.length <= 2000 ? body : body.slice(0, 800)
+        });
+
+        if (viewState) return { viewState, windowId };
+
+        const parsed = parseLoopbackArgs(body);
+        if (!parsed) return { viewState: null, windowId }; // ni loopback ni ViewState: algo inesperado
+
+        windowId = parsed.windowId;
+        windowMode = windowMode === 0 ? 2 : 0;
+    }
+
+    return { viewState: null, windowId };
+}
+
 // Replica paso a paso la navegación real capturada en el HAR: cargar la página,
 // abrir el menú, entrar a "Asignaturas disponibles para cursar", fijar los filtros
 // (mismos valores por defecto de la cuenta: plan/periodo/tipo ya vienen preseleccionados)
 // y hacer clic en "Mostrar". Cada paso queda registrado en `steps` para depurar si algo falla.
 async function fetchCourseDataDebug(session) {
     const { jar } = session;
-    const windowId = randomWindowId();
-    const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
     const steps = [];
 
     function record(name, res) {
@@ -246,17 +309,7 @@ async function fetchCourseDataDebug(session) {
         return body;
     }
 
-    const pageUrl = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=0&Adf-Window-Id=${windowId}&_afrPage=0&_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0`;
-    // Primer golpe: normalmente devuelve la página de "loopback" (AdfLoopbackUtils),
-    // que en un navegador real ejecutaría JS y recargaría la misma URL. Replicamos
-    // ese segundo golpe manualmente.
-    const loopbackRes = await http2Request(jar, 'GET', pageUrl);
-    record('1a-loopback', loopbackRes);
-
-    const pageRes = await http2Request(jar, 'GET', pageUrl);
-    const pageHtml = record('1b-cargar-pagina-real', pageRes);
-    const viewState = extractViewState(pageHtml);
-    steps[steps.length - 1].viewStateEncontrado = !!viewState;
+    const { viewState, windowId } = await loadRealPage(jar, steps);
     if (!viewState) return { ok: false, steps };
 
     const baseUrl = `https://sia.unal.edu.co/ServiciosApp/faces/inicioServicios?Adf-Window-Id=${windowId}&Adf-Page-Id=0`;

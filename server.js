@@ -258,20 +258,19 @@ function parseLoopbackArgs(scriptText) {
 // datos reales: hacen falta 2-3 vueltas antes de recibir la página real con ViewState.
 async function loadRealPage(jar, steps) {
     const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
-    let windowId = randomWindowId();
     let windowMode = 0;
+    // Simula "window.name": en un navegador real se fija UNA sola vez en el primer
+    // rebote y de ahí en adelante se reutiliza siempre, ignorando cualquier otro id
+    // que el servidor vuelva a ofrecer en rebotes posteriores.
+    let lockedWindowId = null;
 
     for (let attempt = 1; attempt <= 8; attempt++) {
-        // _afrLoop distinto en cada intento: evita que una caché (ej. CloudFront)
-        // identifique todos los intentos como la misma URL.
+        const idToSend = lockedWindowId || randomWindowId();
         const afrLoop = Date.now().toString() + Math.floor(Math.random() * 100000);
 
-        // El propio script de loopback también deja esta cookie con el window id
-        // (AdfLoopbackUtils._addCookie); la ponemos nosotros también por si el
-        // servidor la usa para confirmar la ventana, igual que el query param.
-        try { await jar.setCookie(`Adf-Window-Id=${windowId}; path=/`, 'https://sia.unal.edu.co'); } catch (e) {}
+        try { await jar.setCookie(`Adf-Window-Id=${idToSend}; path=/`, 'https://sia.unal.edu.co'); } catch (e) {}
 
-        const url = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=${windowMode}&Adf-Window-Id=${windowId}&_afrPage=0&${mediaParams}`;
+        const url = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=${windowMode}&Adf-Window-Id=${idToSend}&_afrPage=0&${mediaParams}`;
         const res = await http2Request(jar, 'GET', url, undefined, { 'Pragma': 'no-cache' });
         const body = typeof res.data === 'string' ? res.data : '';
         const viewState = extractViewState(body);
@@ -280,8 +279,9 @@ async function loadRealPage(jar, steps) {
 
         steps.push({
             name: `1.${attempt}-cargar-pagina(windowMode=${windowMode})`,
-            requestedWindowId: windowId,
+            requestedWindowId: idToSend,
             serverAssignedWindowId: parsed ? parsed.windowId : null,
+            lockedWindowId,
             nonce: nonceMatch ? nonceMatch[1] : null,
             cacheHeader: res.headers['x-cache'] || null,
             status: res.status,
@@ -291,14 +291,14 @@ async function loadRealPage(jar, steps) {
             preview: body.length <= 2000 ? body : body.slice(0, 800)
         });
 
-        if (viewState) return { viewState, windowId };
-        if (!parsed) return { viewState: null, windowId }; // ni loopback ni ViewState: algo inesperado
+        if (viewState) return { viewState, windowId: idToSend };
+        if (!parsed) return { viewState: null, windowId: idToSend }; // ni loopback ni ViewState: algo inesperado
 
-        windowId = parsed.windowId;
+        if (!lockedWindowId) lockedWindowId = parsed.windowId; // fijar solo la PRIMERA vez
         windowMode = windowMode === 0 ? 2 : 0;
     }
 
-    return { viewState: null, windowId };
+    return { viewState: null, windowId: lockedWindowId };
 }
 
 // Replica paso a paso la navegación real capturada en el HAR: cargar la página,

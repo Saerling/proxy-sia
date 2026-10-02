@@ -260,26 +260,38 @@ async function loadRealPage(jar, steps) {
     const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
     let windowId = randomWindowId();
     let windowMode = 0;
-    const afrLoop = Date.now().toString() + Math.floor(Math.random() * 1000);
 
-    for (let attempt = 1; attempt <= 5; attempt++) {
+    for (let attempt = 1; attempt <= 8; attempt++) {
+        // _afrLoop distinto en cada intento: evita que una caché (ej. CloudFront)
+        // identifique todos los intentos como la misma URL.
+        const afrLoop = Date.now().toString() + Math.floor(Math.random() * 100000);
+
+        // El propio script de loopback también deja esta cookie con el window id
+        // (AdfLoopbackUtils._addCookie); la ponemos nosotros también por si el
+        // servidor la usa para confirmar la ventana, igual que el query param.
+        try { await jar.setCookie(`Adf-Window-Id=${windowId}; path=/`, 'https://sia.unal.edu.co'); } catch (e) {}
+
         const url = `https://sia.unal.edu.co/ServiciosApp/?_afrLoop=${afrLoop}&_afrWindowMode=${windowMode}&Adf-Window-Id=${windowId}&_afrPage=0&${mediaParams}`;
-        const res = await http2Request(jar, 'GET', url);
+        const res = await http2Request(jar, 'GET', url, undefined, { 'Pragma': 'no-cache' });
         const body = typeof res.data === 'string' ? res.data : '';
         const viewState = extractViewState(body);
+        const parsed = parseLoopbackArgs(body);
+        const nonceMatch = body.match(/nonce="([^"]+)"/);
 
         steps.push({
             name: `1.${attempt}-cargar-pagina(windowMode=${windowMode})`,
+            requestedWindowId: windowId,
+            serverAssignedWindowId: parsed ? parsed.windowId : null,
+            nonce: nonceMatch ? nonceMatch[1] : null,
+            cacheHeader: res.headers['x-cache'] || null,
             status: res.status,
             length: body.length,
-            isLoopback: body.includes('AdfLoopbackUtils.runLoopback'),
+            isLoopback: !!parsed,
             viewStateEncontrado: !!viewState,
             preview: body.length <= 2000 ? body : body.slice(0, 800)
         });
 
         if (viewState) return { viewState, windowId };
-
-        const parsed = parseLoopbackArgs(body);
         if (!parsed) return { viewState: null, windowId }; // ni loopback ni ViewState: algo inesperado
 
         windowId = parsed.windowId;

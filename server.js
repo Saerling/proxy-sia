@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const { CookieJar } = require('tough-cookie');
+const puppeteer = require('puppeteer');
 
 const app = express();
 app.use(cors());
@@ -258,6 +259,27 @@ function parseLoopbackArgs(scriptText) {
 // datos reales: hacen falta 2-3 vueltas antes de recibir la página real con ViewState.
 async function loadRealPage(jar, steps) {
     const mediaParams = '_afrFS=16&_afrMT=screen&_afrMFW=1920&_afrMFH=1080&_afrMFDW=1920&_afrMFDH=1080&_afrMFC=24&_afrMFCI=0&_afrMFM=0&_afrMFR=96&_afrMFG=0&_afrMFS=0&_afrMFO=0';
+
+    // Intento 0: acceso directo a la ruta interna de la app (sin pasar por la
+    // página puente de /ServiciosApp/). Si esto solo devuelve otra vez la misma
+    // página puente, seguimos con la danza de rebotes como respaldo (abajo).
+    {
+        const directUrl = `https://sia.unal.edu.co/ServiciosApp/faces/inicioServicios?${mediaParams}`;
+        const res = await http2Request(jar, 'GET', directUrl, undefined, { 'Pragma': 'no-cache' });
+        const body = typeof res.data === 'string' ? res.data : '';
+        const viewState = extractViewState(body);
+        const parsed = parseLoopbackArgs(body);
+        steps.push({
+            name: '0-acceso-directo-inicioServicios',
+            status: res.status,
+            length: body.length,
+            isLoopback: !!parsed,
+            viewStateEncontrado: !!viewState,
+            preview: body.length <= 2000 ? body : body.slice(0, 800)
+        });
+        if (viewState) return { viewState, windowId: randomWindowId() };
+    }
+
     let windowMode = 0;
     // Simula "window.name": en un navegador real se fija UNA sola vez en el primer
     // rebote y de ahí en adelante se reutiliza siempre, ignorando cualquier otro id
@@ -382,6 +404,99 @@ async function fetchCourseDataDebug(session) {
     const courses = parseCoursesFromXml(finalHtml);
     return { ok: true, steps, courses, coursesCount: courses.length };
 }
+
+// ==========================================
+// MISMA TAREA, PERO CON UN NAVEGADOR REAL (Puppeteer) QUE SÍ EJECUTA JAVASCRIPT
+// ==========================================
+// Convierte las cookies ya logueadas (obtenidas con el login HTTP/2 manual) al
+// formato que espera Puppeteer, para no tener que volver a loguear dentro del navegador.
+async function jarToPuppeteerCookies(jar, urls) {
+    const cookies = [];
+    for (const url of urls) {
+        const jarCookies = await jar.getCookies(url);
+        for (const c of jarCookies) {
+            cookies.push({
+                name: c.key,
+                value: c.value,
+                domain: c.domain,
+                path: c.path || '/',
+                httpOnly: !!c.httpOnly,
+                secure: !!c.secure
+            });
+        }
+    }
+    return cookies;
+}
+
+async function fetchCourseDataPuppeteer(session) {
+    const { jar } = session;
+    const steps = [];
+    let browser;
+    try {
+        browser = await puppeteer.launch({
+            headless: 'new',
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        });
+        const page = await browser.newPage();
+        await page.setUserAgent(UA);
+        await page.setViewport({ width: 1920, height: 1080 });
+
+        const cookies = await jarToPuppeteerCookies(jar, [
+            'https://sia.unal.edu.co',
+            'https://autenticasia.unal.edu.co'
+        ]);
+        if (cookies.length > 0) await page.setCookie(...cookies);
+        steps.push({ name: '0-cookies-inyectadas', cantidad: cookies.length });
+
+        await page.goto('https://sia.unal.edu.co/ServiciosApp/', { waitUntil: 'networkidle0', timeout: 30000 });
+        steps.push({ name: '1-cargar-pagina', url: page.url(), title: await page.title() });
+
+        await page.evaluate(() => {
+            const el = document.getElementById('pt1:men-portlets:j_idt25');
+            if (el) el.click();
+        });
+        await new Promise(r => setTimeout(r, 1500));
+
+        const clickedMenuItem = await page.evaluate(() => {
+            const el = document.getElementById('pt1:men-portlets:j_idt29');
+            if (el) { el.click(); return true; }
+            return false;
+        });
+        steps.push({ name: '2-clic-asignaturas-disponibles', clickedMenuItem });
+        await new Promise(r => setTimeout(r, 2000));
+
+        // Los filtros (plan/periodo/tipo) ya vienen con los valores por defecto de la
+        // cuenta, así que vamos directo al clic en "Mostrar".
+        const clickedMostrar = await page.evaluate(() => {
+            const el = document.getElementById('pt1:r1:1:pt_cb1');
+            if (el) { el.click(); return true; }
+            return false;
+        });
+        steps.push({ name: '3-clic-mostrar', clickedMostrar });
+        await new Promise(r => setTimeout(r, 3000));
+
+        const html = await page.content();
+        steps.push({ name: '4-contenido-final', length: html.length, preview: html.length <= 1500 ? html : html.slice(0, 1500) });
+
+        const courses = parseCoursesFromXml(html);
+        return { ok: courses.length > 0, steps, courses, coursesCount: courses.length };
+    } catch (err) {
+        steps.push({ name: 'error', message: String(err.message || err) });
+        return { ok: false, steps, error: String(err.message || err) };
+    } finally {
+        if (browser) await browser.close();
+    }
+}
+
+app.get('/api/sia-directo/cupos-puppeteer', async (req, res) => {
+    try {
+        const session = await getSiaSession();
+        const result = await fetchCourseDataPuppeteer(session);
+        res.json({ generatedAt: new Date().toISOString(), ...result });
+    } catch (err) {
+        res.status(500).json({ generatedAt: new Date().toISOString(), error: String(err.message || err) });
+    }
+});
 
 app.get('/api/sia-directo/cupos-debug', async (req, res) => {
     try {

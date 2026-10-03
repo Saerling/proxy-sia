@@ -4,9 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-  "test": "echo \"Error: no test specified\" && exit 1",
-  "start": "node server.js"
-},
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -16,6 +16,7 @@
     "axios-cookiejar-support": "^7.0.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
+    "puppeteer": "^25.12.0",
     "tough-cookie": "^6.0.2"
   }
 }

@@ -451,32 +451,74 @@ async function fetchCourseDataPuppeteer(session) {
         await page.goto('https://sia.unal.edu.co/ServiciosApp/', { waitUntil: 'networkidle0', timeout: 30000 });
         steps.push({ name: '1-cargar-pagina', url: page.url(), title: await page.title() });
 
-        await page.evaluate(() => {
-            const el = document.getElementById('pt1:men-portlets:j_idt25');
-            if (el) el.click();
-        });
+        // Diagnóstico: listar todos los frames (el menú/contenido de ADF suele vivir
+        // dentro de un <iframe>, no en el documento principal) y si cada uno contiene
+        // el texto "men-portlets" (parte del menú que buscamos).
+        const frames = page.frames();
+        const frameInfo = [];
+        for (const f of frames) {
+            let hasMenu = false;
+            try {
+                hasMenu = await f.evaluate(() => document.body && document.body.innerHTML.includes('men-portlets'));
+            } catch (e) { /* frame cross-origin o no accesible */ }
+            frameInfo.push({ url: f.url(), hasMenuText: hasMenu });
+        }
+        steps.push({ name: '1b-frames-encontrados', frames: frameInfo });
+
+        // Busca un elemento por id en TODOS los frames y devuelve el frame donde está.
+        async function findFrameWithElement(elementId) {
+            for (const f of frames) {
+                try {
+                    const found = await f.evaluate((id) => !!document.getElementById(id), elementId);
+                    if (found) return f;
+                } catch (e) { /* ignorar frames no accesibles */ }
+            }
+            return null;
+        }
+
+        const menuFrame = await findFrameWithElement('pt1:men-portlets:j_idt25');
+        steps.push({ name: '2a-frame-del-menu', encontrado: !!menuFrame, url: menuFrame ? menuFrame.url() : null });
+
+        if (menuFrame) {
+            await menuFrame.evaluate(() => {
+                const el = document.getElementById('pt1:men-portlets:j_idt25');
+                if (el) el.click();
+            });
+        }
         await new Promise(r => setTimeout(r, 1500));
 
-        const clickedMenuItem = await page.evaluate(() => {
+        const clickedMenuItem = menuFrame ? await menuFrame.evaluate(() => {
             const el = document.getElementById('pt1:men-portlets:j_idt29');
             if (el) { el.click(); return true; }
             return false;
-        });
+        }) : false;
         steps.push({ name: '2-clic-asignaturas-disponibles', clickedMenuItem });
         await new Promise(r => setTimeout(r, 2000));
 
         // Los filtros (plan/periodo/tipo) ya vienen con los valores por defecto de la
-        // cuenta, así que vamos directo al clic en "Mostrar".
-        const clickedMostrar = await page.evaluate(() => {
+        // cuenta, así que vamos directo al clic en "Mostrar". Puede estar en OTRO frame
+        // si "Asignaturas disponibles" abrió contenido nuevo, así que volvemos a buscar.
+        const framesAfterNav = page.frames();
+        let mostrarFrame = null;
+        for (const f of framesAfterNav) {
+            try {
+                const found = await f.evaluate(() => !!document.getElementById('pt1:r1:1:pt_cb1'));
+                if (found) { mostrarFrame = f; break; }
+            } catch (e) { /* ignorar */ }
+        }
+        steps.push({ name: '2b-frame-de-mostrar', encontrado: !!mostrarFrame, url: mostrarFrame ? mostrarFrame.url() : null, totalFrames: framesAfterNav.length });
+
+        const clickedMostrar = mostrarFrame ? await mostrarFrame.evaluate(() => {
             const el = document.getElementById('pt1:r1:1:pt_cb1');
             if (el) { el.click(); return true; }
             return false;
-        });
+        }) : false;
         steps.push({ name: '3-clic-mostrar', clickedMostrar });
         await new Promise(r => setTimeout(r, 3000));
 
-        const html = await page.content();
-        steps.push({ name: '4-contenido-final', length: html.length, preview: html.length <= 1500 ? html : html.slice(0, 1500) });
+        const contentFrame = mostrarFrame || menuFrame || page.mainFrame();
+        const html = await contentFrame.content();
+        steps.push({ name: '4-contenido-final', frameUrl: contentFrame.url(), length: html.length, preview: html.length <= 1500 ? html : html.slice(0, 1500) });
 
         const courses = parseCoursesFromXml(html);
         return { ok: courses.length > 0, steps, courses, coursesCount: courses.length };

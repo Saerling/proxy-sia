@@ -465,6 +465,18 @@ async function fetchCourseDataPuppeteer(session) {
         }
         steps.push({ name: '1b-frames-encontrados', frames: frameInfo });
 
+        // Diagnóstico: en vez de asumir el ID exacto del menú (capturado en una sesión
+        // vieja), buscamos todos los elementos cuyo id contenga "men-portlets" o el
+        // texto visible mencione "Asignaturas", para ver los IDs reales de ahora mismo.
+        const menuElements = await page.evaluate(() => {
+            const results = [];
+            document.querySelectorAll('[id*="men-portlets"]').forEach(el => {
+                results.push({ id: el.id, tag: el.tagName, text: (el.textContent || '').trim().slice(0, 60) });
+            });
+            return results;
+        });
+        steps.push({ name: '1c-elementos-menu-reales', menuElements });
+
         // Busca un elemento por id en TODOS los frames y devuelve el frame donde está.
         async function findFrameWithElement(elementId) {
             for (const f of frames) {
@@ -478,6 +490,19 @@ async function fetchCourseDataPuppeteer(session) {
 
         const menuFrame = await findFrameWithElement('pt1:men-portlets:j_idt25');
         steps.push({ name: '2a-frame-del-menu', encontrado: !!menuFrame, url: menuFrame ? menuFrame.url() : null });
+
+        // Diagnóstico: listar los IDs y textos reales de todo lo que empiece con
+        // "pt1:men-portlets" en el frame principal, ya que el sufijo (j_idtNN) parece
+        // no ser fijo entre sesiones.
+        const realMenuIds = await page.evaluate(() => {
+            const els = document.querySelectorAll('[id*="men-portlets"]');
+            return Array.from(els).slice(0, 40).map(el => ({
+                id: el.id,
+                tag: el.tagName,
+                text: (el.textContent || '').trim().slice(0, 60)
+            }));
+        });
+        steps.push({ name: '2a2-ids-reales-del-menu', cantidad: realMenuIds.length, elementos: realMenuIds });
 
         if (menuFrame) {
             await menuFrame.evaluate(() => {

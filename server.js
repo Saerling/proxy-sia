@@ -488,35 +488,36 @@ async function fetchCourseDataPuppeteer(session) {
             return null;
         }
 
-        const menuFrame = await findFrameWithElement('pt1:men-portlets:j_idt25');
-        steps.push({ name: '2a-frame-del-menu', encontrado: !!menuFrame, url: menuFrame ? menuFrame.url() : null });
-
-        // Diagnóstico: listar los IDs y textos reales de todo lo que empiece con
-        // "pt1:men-portlets" en el frame principal, ya que el sufijo (j_idtNN) parece
-        // no ser fijo entre sesiones.
-        const realMenuIds = await page.evaluate(() => {
-            const els = document.querySelectorAll('[id*="men-portlets"]');
-            return Array.from(els).slice(0, 40).map(el => ({
-                id: el.id,
-                tag: el.tagName,
-                text: (el.textContent || '').trim().slice(0, 60)
-            }));
+        // "Información académica" ya confirmado por id real: pt1:men-portlets:j_idt9
+        // (el ::disAcr es el <a> que funciona como interruptor de la sección acordeón).
+        const expandClicked = await page.evaluate(() => {
+            const el = document.getElementById('pt1:men-portlets:j_idt9::disAcr')
+                || document.getElementById('pt1:men-portlets:j_idt9::btn')
+                || document.getElementById('pt1:men-portlets:j_idt9::head');
+            if (el) { el.click(); return el.id; }
+            return null;
         });
-        steps.push({ name: '2a2-ids-reales-del-menu', cantidad: realMenuIds.length, elementos: realMenuIds });
-
-        if (menuFrame) {
-            await menuFrame.evaluate(() => {
-                const el = document.getElementById('pt1:men-portlets:j_idt25');
-                if (el) el.click();
-            });
-        }
+        steps.push({ name: '2a-expandir-informacion-academica', expandClicked });
         await new Promise(r => setTimeout(r, 1500));
 
-        const clickedMenuItem = menuFrame ? await menuFrame.evaluate(() => {
-            const el = document.getElementById('pt1:men-portlets:j_idt29');
+        // Listar lo que apareció nuevo (el submenú), para encontrar el id real de
+        // "Asignaturas disponibles para cursar" sin volver a adivinar.
+        const submenuItems = await page.evaluate(() => {
+            const els = document.querySelectorAll('[id*="men-portlets"] a, [id*="men-portlets"] td');
+            return Array.from(els)
+                .map(el => ({ id: el.id, tag: el.tagName, text: (el.textContent || '').trim() }))
+                .filter(x => x.text && x.text.length > 0);
+        });
+        steps.push({ name: '2b-items-del-submenu', cantidad: submenuItems.length, elementos: submenuItems.slice(0, 60) });
+
+        const asignaturasItem = submenuItems.find(x => /asignaturas disponibles/i.test(x.text));
+        steps.push({ name: '2c-item-asignaturas-encontrado', encontrado: !!asignaturasItem, item: asignaturasItem || null });
+
+        const clickedMenuItem = asignaturasItem ? await page.evaluate((id) => {
+            const el = document.getElementById(id);
             if (el) { el.click(); return true; }
             return false;
-        }) : false;
+        }, asignaturasItem.id) : false;
         steps.push({ name: '2-clic-asignaturas-disponibles', clickedMenuItem });
         await new Promise(r => setTimeout(r, 2000));
 
@@ -541,7 +542,7 @@ async function fetchCourseDataPuppeteer(session) {
         steps.push({ name: '3-clic-mostrar', clickedMostrar });
         await new Promise(r => setTimeout(r, 3000));
 
-        const contentFrame = mostrarFrame || menuFrame || page.mainFrame();
+        const contentFrame = mostrarFrame || page.mainFrame();
         const html = await contentFrame.content();
         steps.push({ name: '4-contenido-final', frameUrl: contentFrame.url(), length: html.length, preview: html.length <= 1500 ? html : html.slice(0, 1500) });
 

@@ -553,9 +553,33 @@ async function fetchCourseDataPuppeteer(session) {
 
         const contentFrame = mostrarFrame || page.mainFrame();
         const html = await contentFrame.content();
-        steps.push({ name: '4-contenido-final', frameUrl: contentFrame.url(), length: html.length, preview: html.length <= 1500 ? html : html.slice(0, 1500) });
+        steps.push({ name: '4-contenido-final', frameUrl: contentFrame.url(), length: html.length });
 
-        const courses = parseCoursesFromXml(html);
+        // Leemos la tabla directamente del DOM ya renderizado (más confiable que
+        // parsear el HTML serializado, que el navegador puede reordenar).
+        const rowCount = await contentFrame.evaluate(() => document.querySelectorAll('tr.af_table_data-row').length);
+        steps.push({ name: '5-filas-encontradas-en-dom', rowCount });
+
+        const courses = await contentFrame.evaluate(() => {
+            const rows = document.querySelectorAll('tr.af_table_data-row');
+            const result = [];
+            rows.forEach(row => {
+                const spans = row.querySelectorAll('span');
+                if (spans.length >= 4) {
+                    const nameCode = (spans[0].textContent || '').trim();
+                    const m = nameCode.match(/^(.*)\s\(([^)]+)\)\s*$/);
+                    result.push({
+                        name: m ? m[1].trim() : nameCode,
+                        code: m ? m[2].trim() : '',
+                        typology: (spans[1].textContent || '').trim(),
+                        credits: (spans[2].textContent || '').trim(),
+                        available: (spans[3].textContent || '').trim()
+                    });
+                }
+            });
+            return result;
+        });
+
         return { ok: courses.length > 0, steps, courses, coursesCount: courses.length };
     } catch (err) {
         steps.push({ name: 'error', message: String(err.message || err) });

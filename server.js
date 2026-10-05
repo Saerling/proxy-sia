@@ -488,16 +488,25 @@ async function fetchCourseDataPuppeteer(session) {
             return null;
         }
 
-        // "Información académica" ya confirmado por id real: pt1:men-portlets:j_idt9
-        // (el ::disAcr es el <a> que funciona como interruptor de la sección acordeón).
+        // "Asignaturas disponibles para cursar" vive bajo "Proceso de inscripción"
+        // (confirmado en la captura real del portal), no bajo "Información académica".
+        // Buscamos la sección por su TEXTO (el "::head"), no por un id fijo, porque
+        // el sufijo j_idtNN cambia entre sesiones -- y de ahí derivamos su "::disAcr".
         const expandClicked = await page.evaluate(() => {
-            const el = document.getElementById('pt1:men-portlets:j_idt9::disAcr')
-                || document.getElementById('pt1:men-portlets:j_idt9::btn')
-                || document.getElementById('pt1:men-portlets:j_idt9::head');
-            if (el) { el.click(); return el.id; }
+            const heads = document.querySelectorAll('[id$="::head"]');
+            for (const h of heads) {
+                if ((h.textContent || '').trim() === 'Proceso de inscripción') {
+                    const prefix = h.id.replace(/::head$/, '');
+                    const el = document.getElementById(prefix + '::disAcr')
+                        || document.getElementById(prefix + '::btn')
+                        || h;
+                    el.click();
+                    return el.id;
+                }
+            }
             return null;
         });
-        steps.push({ name: '2a-expandir-informacion-academica', expandClicked });
+        steps.push({ name: '2a-expandir-proceso-inscripcion', expandClicked });
         await new Promise(r => setTimeout(r, 1500));
 
         // Listar lo que apareció nuevo (el submenú), para encontrar el id real de

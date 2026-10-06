@@ -560,6 +560,21 @@ async function fetchCourseDataPuppeteer(session) {
         const rowCount = await contentFrame.evaluate(() => document.querySelectorAll('tr.af_table_data-row').length);
         steps.push({ name: '5-filas-encontradas-en-dom', rowCount });
 
+        if (rowCount === 0) {
+            // Diagnóstico amplio: ¿hay AL MENOS alguna tabla/fila en el DOM? ¿aparece
+            // el texto "CUPOS" en algún lado? ¿qué clases tienen los <tr> que sí existen?
+            const diag = await contentFrame.evaluate(() => {
+                const bodyText = document.body ? document.body.textContent || '' : '';
+                const allTr = Array.from(document.querySelectorAll('tr'));
+                const trClasses = [...new Set(allTr.map(tr => tr.className).filter(c => c))].slice(0, 20);
+                const hasCuposText = bodyText.includes('CUPOS') || bodyText.includes('Cupos');
+                const hasAsignaturaText = bodyText.includes('ASIGNATURA') || bodyText.includes('Asignatura');
+                const anyTableIds = Array.from(document.querySelectorAll('table')).map(t => t.id).filter(Boolean).slice(0, 20);
+                return { totalTr: allTr.length, trClasses, hasCuposText, hasAsignaturaText, anyTableIds };
+            });
+            steps.push({ name: '5b-diagnostico-tabla', ...diag });
+        }
+
         const courses = await contentFrame.evaluate(() => {
             const rows = document.querySelectorAll('tr.af_table_data-row');
             const result = [];

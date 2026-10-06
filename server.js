@@ -548,11 +548,18 @@ async function fetchCourseDataPuppeteer(session) {
         const botonInfo = mostrarFrame ? await mostrarFrame.evaluate(() => {
             const el = document.getElementById('pt1:r1:1:pt_cb1');
             if (!el) return null;
+            const rect = el.getBoundingClientRect();
+            const cx = rect.left + rect.width / 2;
+            const cy = rect.top + rect.height / 2;
+            const real = document.elementFromPoint(cx, cy);
             return {
                 tag: el.tagName,
                 text: (el.textContent || '').trim(),
                 disabled: el.disabled || el.getAttribute('aria-disabled') === 'true',
-                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length),
+                innerHTML: el.innerHTML.slice(0, 600),
+                rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+                elementoEnEsasCoordenadas: real ? { tag: real.tagName, id: real.id, class: real.className } : null
             };
         }) : null;
         steps.push({ name: '2c-boton-mostrar-info', botonInfo });

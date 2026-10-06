@@ -543,13 +543,38 @@ async function fetchCourseDataPuppeteer(session) {
         }
         steps.push({ name: '2b-frame-de-mostrar', encontrado: !!mostrarFrame, url: mostrarFrame ? mostrarFrame.url() : null, totalFrames: framesAfterNav.length });
 
-        const clickedMostrar = mostrarFrame ? await mostrarFrame.evaluate(() => {
+        // Diagnóstico del botón antes de tocarlo (por si está deshabilitado o ni
+        // siquiera es el botón "Mostrar" real).
+        const botonInfo = mostrarFrame ? await mostrarFrame.evaluate(() => {
             const el = document.getElementById('pt1:r1:1:pt_cb1');
-            if (el) { el.click(); return true; }
-            return false;
-        }) : false;
+            if (!el) return null;
+            return {
+                tag: el.tagName,
+                text: (el.textContent || '').trim(),
+                disabled: el.disabled || el.getAttribute('aria-disabled') === 'true',
+                visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+            };
+        }) : null;
+        steps.push({ name: '2c-boton-mostrar-info', botonInfo });
+
+        // Clic REAL con el mouse de Puppeteer (no un .click() disparado desde JS),
+        // por si el botón necesita un evento de usuario "de verdad" para activarse.
+        let clickedMostrar = false;
+        if (mostrarFrame) {
+            try {
+                const handle = await mostrarFrame.$('#pt1\\:r1\\:1\\:pt_cb1') || await mostrarFrame.evaluateHandle(
+                    () => document.getElementById('pt1:r1:1:pt_cb1')
+                );
+                if (handle) {
+                    await handle.click();
+                    clickedMostrar = true;
+                }
+            } catch (e) {
+                steps.push({ name: '3-clic-mostrar-error', message: String(e.message || e) });
+            }
+        }
         steps.push({ name: '3-clic-mostrar', clickedMostrar });
-        await new Promise(r => setTimeout(r, 3000));
+        await new Promise(r => setTimeout(r, 6000));
 
         const contentFrame = mostrarFrame || page.mainFrame();
         const html = await contentFrame.content();

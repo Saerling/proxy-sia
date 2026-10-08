@@ -448,6 +448,29 @@ async function fetchCourseDataPuppeteer(session) {
         if (cookies.length > 0) await page.setCookie(...cookies);
         steps.push({ name: '0-cookies-inyectadas', cantidad: cookies.length });
 
+        // Oculta la señal más común de automatización (navigator.webdriver), por si
+        // el portal altera su comportamiento al detectar un navegador headless.
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => false });
+        });
+
+        // Capturamos red y consola desde ahora, para ver exactamente qué pasa
+        // (o no pasa) cuando hagamos clic en "Mostrar" más adelante.
+        const networkLog = [];
+        const consoleLog = [];
+        page.on('request', (req) => {
+            if (req.url().includes('inicioServicios') || req.method() === 'POST') {
+                networkLog.push({ tipo: 'request', method: req.method(), url: req.url().slice(0, 150) });
+            }
+        });
+        page.on('response', (res) => {
+            if (res.url().includes('inicioServicios') || res.request().method() === 'POST') {
+                networkLog.push({ tipo: 'response', status: res.status(), url: res.url().slice(0, 150) });
+            }
+        });
+        page.on('console', (msg) => consoleLog.push(`[${msg.type()}] ${msg.text()}`.slice(0, 200)));
+        page.on('pageerror', (err) => consoleLog.push(`[pageerror] ${String(err).slice(0, 200)}`));
+
         await page.goto('https://sia.unal.edu.co/ServiciosApp/', { waitUntil: 'networkidle0', timeout: 30000 });
         steps.push({ name: '1-cargar-pagina', url: page.url(), title: await page.title() });
 
@@ -582,6 +605,10 @@ async function fetchCourseDataPuppeteer(session) {
         }
         steps.push({ name: '3-clic-mostrar', clickedMostrar });
         await new Promise(r => setTimeout(r, 6000));
+
+        // ¿Salió alguna petición al servidor tras el clic? ¿Hubo errores de JavaScript?
+        steps.push({ name: '3b-red-capturada', cantidad: networkLog.length, ultimas: networkLog.slice(-15) });
+        steps.push({ name: '3c-consola-capturada', cantidad: consoleLog.length, ultimas: consoleLog.slice(-15) });
 
         const contentFrame = mostrarFrame || page.mainFrame();
         const html = await contentFrame.content();

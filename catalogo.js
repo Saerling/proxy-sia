@@ -399,8 +399,9 @@ async function openSession(transportFactory, trace) {
   adf.post = async function post(name, extra) {
     const body = new URLSearchParams();
     for (const k of CHOSEN_ORDER) if (k in adf.chosen) body.append(F + k, adf.chosen[k]);
-    body.append(F + 'soc5', '');
-    body.append(F + 'soc10', '0');
+    body.append(F + 'soc5', 'soc5' in adf.chosen ? adf.chosen.soc5 : '');    // "¿Por qué deseas buscar?" (solo libre elección)
+    body.append(F + 'soc10', 'soc10' in adf.chosen ? adf.chosen.soc10 : '0'); // sede del filtro de libre elección
+    for (const k of ['soc6', 'soc7', 'soc8']) if (k in adf.chosen) body.append(F + k, adf.chosen[k]);
     body.append(F + 'it10', '');
     body.append(F + 'it11', '');
     body.append('org.apache.myfaces.trinidad.faces.FORM', 'f1');
@@ -479,6 +480,9 @@ async function cascade(adf, f, upTo, trace) {
 }
 
 async function search(adf, f, trace) {
+  if (/^libre/.test(norm(f.tipologia || ''))) {
+    throw httpError(400, 'La tipología Libre elección tiene filtros propios: usa /api/catalogo/libre (modo=facultad o modo=plan).');
+  }
   const sel = await cascade(adf, f, 'buscar', trace);
   const xml = await adf.post('8-buscar', {
     event: F + 'cb1',
@@ -489,6 +493,53 @@ async function search(adf, f, trace) {
     return { seleccion: sel, rowCount: 0, courses: [] }; // consulta sin resultados
   }
   return { seleccion: sel, ...parseCourses(xml) };
+}
+
+// Libre elección. El SIA exige un primer filtro (en los HAR: facultad "2000 SEDE BOGOTÁ" + plan "2CLE" + tipología
+// LIBRE ELECCIÓN) y luego pregunta "¿Por qué deseas buscar?":
+//   modo=plan      -> "Por plan de estudios": se elige un pseudo-plan (2CLE, 4CLE, ...)
+//   modo=facultad  -> "Por facultad y plan": sede + facultad, con el plan en blanco (todas las de esa facultad)
+const LIBRE_BASE = { nivel: 'pregrado', sede: '1101', facultad: '2000', plan: '2CLE', tipologia: 'libre eleccion' };
+
+async function searchLibre(adf, f, trace) {
+  const modo = f.modo === 'plan' ? 'plan' : 'facultad';
+  await cascade(adf, LIBRE_BASE, 'buscar', trace);
+  adf.chosen.soc5 = pickOption(adf.selects.soc5, modo === 'plan' ? 'por plan de estudios' : 'por facultad y plan', '¿Por qué deseas buscar?').value;
+  await adf.valueChange('8-por-que-buscar', 'soc5');
+
+  const sel = { modo };
+  if (modo === 'plan') {
+    const plan = pickOption(adf.selects.soc8, f.plan || '2CLE', 'plan de libre elección');
+    adf.chosen.soc8 = plan.value;
+    sel.plan = plan.label;
+    await adf.valueChange('9-plan-libre', 'soc8');
+  } else {
+    const sede = pickOption(adf.selects.soc10, f.sede || '1101', 'sede');
+    adf.chosen.soc10 = sede.value;
+    adf.chosen.soc6 = '';                       // el navegador ya envía soc6 vacío en este paso
+    sel.sede = sede.label;
+    await adf.valueChange('9-sede-libre', 'soc10');
+    const fac = pickOption(adf.selects.soc6, f.facultad || '2000', 'facultad');
+    adf.chosen.soc6 = fac.value;
+    sel.facultad = fac.label;
+    await adf.valueChange('10-facultad-libre', 'soc6');
+    adf.chosen.soc7 = '';                       // plan en blanco, como en la captura
+  }
+
+  const xml = await adf.post('11-buscar', {
+    event: F + 'cb1',
+    [`event.${F}cb1`]: EV_ACTION,
+    'oracle.adf.view.rich.PROCESS': `pt1:r1,${F}cb1`
+  });
+  if (!xml.includes('id="pt1:r1:0:t4"')) return { seleccion: sel, rowCount: 0, filas: 0, completo: true, courses: [] };
+  const parsed = parseCourses(xml);
+  // El SIA repite la misma asignatura en varias filas (una por plan/facultad): se deja la primera de cada código.
+  const seen = new Set();
+  const courses = parsed.courses.filter((c) => !seen.has(c.codigo) && seen.add(c.codigo));
+  return {
+    seleccion: sel, rowCount: parsed.rowCount, filas: parsed.courses.length,
+    completo: parsed.courses.length === parsed.rowCount, courses
+  };
 }
 
 async function openDetail(adf, course, rowCount) {
@@ -587,25 +638,31 @@ function createCatalogo({ transportFactory = createHttpTransport } = {}) {
     }));
   }
 
-  async function getAsignaturas(f) {
+  const libreKey = (f) => ['libre', f.modo === 'plan' ? 'plan' : 'facultad', norm(f.plan ?? ''), norm(f.sede ?? ''), norm(f.facultad ?? '')].join('|');
+
+  async function getAsignaturas(f, { libre = false } = {}) {
     const trace = [];
-    const { value, cached } = await memo('lst|' + key(f), TTL_LIST, () => limit(() => withRetry(async () => {
+    const k = libre ? libreKey(f) : key(f);
+    const run = libre ? searchLibre : search;
+    const { value, cached } = await memo('lst|' + k, TTL_LIST, () => limit(() => withRetry(async () => {
       trace.length = 0;
       const adf = await openSession(transportFactory, trace);
-      return search(adf, f, trace);
+      return run(adf, f, trace);
     })));
     return { ...value, cached, trace };
   }
 
-  async function getGrupos(f, codigos) {
+  async function getGrupos(f, codigos, { libre = false } = {}) {
     const out = [];
+    const k = libre ? libreKey(f) : key(f);
+    const run = libre ? searchLibre : search;
     for (const code of codigos) {
       const trace = [];
       try {
-        const { value, cached } = await memo(`det|${key(f)}|${norm(code)}`, TTL_DETAIL, () => limit(() => withRetry(async () => {
+        const { value, cached } = await memo(`det|${k}|${norm(code)}`, TTL_DETAIL, () => limit(() => withRetry(async () => {
           trace.length = 0;
           const adf = await openSession(transportFactory, trace);
-          const s = await search(adf, f, trace);
+          const s = await run(adf, f, trace);
           const course = findCourse(s.courses, code);
           const detalle = await openDetail(adf, course, s.rowCount);
           return { seleccion: s.seleccion, ...detalle };
@@ -618,7 +675,31 @@ function createCatalogo({ transportFactory = createHttpTransport } = {}) {
     return out;
   }
 
-  return { getOpciones, getAsignaturas, getGrupos };
+  // Pseudo-planes de libre elección (modo=plan) o facultades de una sede (modo=facultad)
+  async function getLibreOpciones(f) {
+    const trace = [];
+    return limit(() => withRetry(async () => {
+      trace.length = 0;
+      const modo = f.modo === 'plan' ? 'plan' : 'facultad';
+      const adf = await openSession(transportFactory, trace);
+      await cascade(adf, LIBRE_BASE, 'buscar', trace);
+      adf.chosen.soc5 = pickOption(adf.selects.soc5, modo === 'plan' ? 'por plan de estudios' : 'por facultad y plan', '¿Por qué deseas buscar?').value;
+      await adf.valueChange('8-por-que-buscar', 'soc5');
+      let opciones;
+      if (modo === 'plan') {
+        opciones = toOptionList(adf.selects.soc8).filter((o) => f.todos || /CLE|PEL|LIBRE/i.test(o.label));
+      } else {
+        const sede = pickOption(adf.selects.soc10, f.sede || '1101', 'sede');
+        adf.chosen.soc10 = sede.value;
+        adf.chosen.soc6 = '';
+        await adf.valueChange('9-sede-libre', 'soc10');
+        opciones = toOptionList(adf.selects.soc6);
+      }
+      return { modo, opciones, trace: [...trace] };
+    }));
+  }
+
+  return { getOpciones, getAsignaturas, getGrupos, getLibreOpciones };
 }
 
 // ---------------------------------------------------------------------------
@@ -660,6 +741,30 @@ function register(app, opts) {
     return { seleccion: r.seleccion, total: r.rowCount, devueltas: courses.length, cached: r.cached, asignaturas: courses, trace: r.trace };
   }));
 
+  // ---- Libre elección --------------------------------------------------------------------------
+  // modo=facultad (por defecto): ?sede=1101&facultad=2000   -> todas las de esa sede/facultad (en Bogotá: la sede completa)
+  // modo=plan:                   ?plan=2CLE                 -> un componente (2CLE, 4CLE, ...). /libre/opciones?modo=plan los lista.
+  const readL = (q) => ({ modo: q.modo, plan: q.plan, sede: q.sede, facultad: q.facultad, todos: q.todos === '1' });
+
+  app.get('/api/catalogo/libre/opciones', wrap(async (req) => cat.getLibreOpciones(readL(req.query))));
+
+  app.get('/api/catalogo/libre', wrap(async (req) => {
+    const r = await cat.getAsignaturas(readL(req.query), { libre: true });
+    const q = req.query.q ? norm(req.query.q) : null;
+    const courses = q ? r.courses.filter((c) => norm(c.nombre).includes(q) || norm(c.codigo).includes(q)) : r.courses;
+    return {
+      seleccion: r.seleccion, filasSia: r.filas, unicas: r.courses.length, repetidas: r.filas - r.courses.length,
+      completo: r.completo, devueltas: courses.length, cached: r.cached, asignaturas: courses, trace: r.trace
+    };
+  }));
+
+  app.get('/api/catalogo/libre/grupos', wrap(async (req) => {
+    const codigos = String(req.query.codigos || req.query.codigo || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (!codigos.length) throw httpError(400, 'Falta ?codigo= (o ?codigos=A,B,C).');
+    if (codigos.length > 8) throw httpError(400, 'Máximo 8 códigos por petición.');
+    return { resultados: await cat.getGrupos(readL(req.query), codigos, { libre: true }) };
+  }));
+
   // Grupos, profesores, horarios y cupos. ?codigo=1000003-B  o  ?codigos=1000003-B,2015707 (máx. 8)
   app.get('/api/catalogo/grupos', wrap(async (req) => {
     const f = readF(req.query);
@@ -674,5 +779,5 @@ function register(app, opts) {
 
 module.exports = {
   register, createCatalogo,
-  _internal: { parseSelects, parseCourses, parseDetail, parseLoopback, pickOption, openSession, search, openDetail, findCourse }
+  _internal: { searchLibre, parseSelects, parseCourses, parseDetail, parseLoopback, pickOption, openSession, search, openDetail, findCourse }
 };

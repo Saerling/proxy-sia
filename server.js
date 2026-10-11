@@ -3,10 +3,27 @@ const cors = require('cors');
 const axios = require('axios');
 const { CookieJar } = require('tough-cookie');
 const puppeteer = require('puppeteer');
+const crypto = require('crypto');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+app.set('trust proxy', 1); // Railway va detrás de un proxy: así req.ip es la IP real (solo para límites en memoria)
+
+// CORS: define ALLOWED_ORIGINS en Railway con el dominio de tu página (varios, separados por coma).
+// Si no la defines, queda abierto a cualquier origen (como antes).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+app.use(cors(ALLOWED_ORIGINS.length ? { origin: ALLOWED_ORIGINS } : undefined));
+app.use(express.json({ limit: '20kb' }));
+
+// Protege las rutas internas/de depuración y el panel de moderación.
+// Envía la clave en la cabecera x-admin-key (o ?key=... para probar desde el navegador).
+function requireAdmin(req, res, next) {
+    const esperado = process.env.ADMIN_KEY;
+    if (!esperado) return res.status(503).json({ error: 'ADMIN_KEY no está configurada en el servidor.' });
+    const dado = String(req.get('x-admin-key') || req.query.key || '');
+    const h = (x) => crypto.createHash('sha256').update(x).digest();
+    if (!crypto.timingSafeEqual(h(dado), h(esperado))) return res.status(401).json({ error: 'No autorizado.' });
+    next();
+}
 
 app.get('/', (req, res) => {
     res.send('¡Mi proxy está funcionando!');
@@ -158,7 +175,7 @@ async function getSiaSession() {
     return siaSession;
 }
 
-app.get('/api/sia-directo/debug-login', async (req, res) => {
+app.get('/api/sia-directo/debug-login', requireAdmin, async (req, res) => {
     try {
         const result = await loginToSia();
         res.json({
@@ -663,7 +680,7 @@ async function fetchCourseDataPuppeteer(session) {
     }
 }
 
-app.get('/api/sia-directo/cupos-puppeteer', async (req, res) => {
+app.get('/api/sia-directo/cupos-puppeteer', requireAdmin, async (req, res) => {
     try {
         const session = await getSiaSession();
         const result = await fetchCourseDataPuppeteer(session);
@@ -673,7 +690,7 @@ app.get('/api/sia-directo/cupos-puppeteer', async (req, res) => {
     }
 });
 
-app.get('/api/sia-directo/cupos-debug', async (req, res) => {
+app.get('/api/sia-directo/cupos-debug', requireAdmin, async (req, res) => {
     try {
         const session = await getSiaSession();
         const result = await fetchCourseDataDebug(session);
@@ -681,6 +698,16 @@ app.get('/api/sia-directo/cupos-debug', async (req, res) => {
     } catch (err) {
         res.status(500).json({ generatedAt: new Date().toISOString(), error: String(err.message || err) });
     }
+});
+
+// Reseñas de profesores (anónimas, con moderación automática)
+const resenas = require('./resenas').register(app, { requireAdmin });
+
+// Cada vez que el catálogo devuelve grupos, anotamos los profesores: solo a ellos se les pueden dejar reseñas.
+app.use('/api/catalogo/grupos', (req, res, next) => {
+    const jsonOriginal = res.json.bind(res);
+    res.json = (body) => { try { resenas.registrarDesdeCatalogo(body); } catch (e) { /* no bloquear la respuesta */ } return jsonOriginal(body); };
+    next();
 });
 
 require('./catalogo').register(app);

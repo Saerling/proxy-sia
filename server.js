@@ -711,5 +711,52 @@ app.use('/api/catalogo/grupos', (req, res, next) => {
 });
 
 require('./catalogo').register(app);
+// ==========================================
+// COMENTARIOS PRIVADOS (llegan solo al dueño, por Telegram)
+// ==========================================
+// Variables de entorno en Render: TG_TOKEN (token del bot) y TG_CHAT_ID (tu id de chat).
+// No se guarda nada en el servidor ni existe ninguna ruta pública para leerlos.
+if (!process.env.TG_TOKEN || !process.env.TG_CHAT_ID) {
+    console.warn('comentarios: faltan TG_TOKEN o TG_CHAT_ID en las variables de entorno');
+}
+const _fbHits = new Map(); // ip -> [marcas de tiempo]
+const _fbTipos = ['Comentario', 'Sugerencia', 'Queja'];
+setInterval(() => {
+    const ahora = Date.now();
+    for (const [ip, t] of _fbHits) { if (!t.some((x) => ahora - x < 3600000)) _fbHits.delete(ip); }
+}, 3600000).unref();
+
+app.post('/api/comentarios', async (req, res) => {
+    try {
+        if (!process.env.TG_TOKEN || !process.env.TG_CHAT_ID) return res.status(503).json({ ok: false });
+
+        // Límite: 5 mensajes por hora por IP
+        const ahora = Date.now();
+        const hits = (_fbHits.get(req.ip) || []).filter((t) => ahora - t < 3600000);
+        if (hits.length >= 5) return res.status(429).json({ ok: false, error: 'Demasiados mensajes' });
+
+        const b = req.body || {};
+        const tipo = _fbTipos.includes(b.tipo) ? b.tipo : 'Comentario';
+        const mensaje = String(b.mensaje || '').trim().slice(0, 1000);
+        const contacto = String(b.contacto || '').trim().slice(0, 80);
+        if (mensaje.length < 10) return res.status(400).json({ ok: false, error: 'Mensaje muy corto' });
+
+        hits.push(ahora);
+        _fbHits.set(req.ip, hits);
+
+        const texto = `📨 ${tipo} · Malla IQ v${String(b.v || '').slice(0, 8)}\n\n${mensaje}\n\nContacto: ${contacto || '(anónimo)'}`;
+        const r = await fetch(`https://api.telegram.org/bot${process.env.TG_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: process.env.TG_CHAT_ID, text: texto })
+        });
+        if (!r.ok) throw new Error('Telegram respondió ' + r.status + ': ' + (await r.text()));
+        res.json({ ok: true });
+    } catch (e) {
+        console.error('comentarios:', e.message);
+        res.status(500).json({ ok: false });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy listo en http://localhost:${PORT}`));

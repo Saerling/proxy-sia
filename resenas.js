@@ -44,6 +44,11 @@ function claveProfesor(nombre) {
   return toks.sort().join(' ');
 }
 
+// Palabras de una búsqueda, normalizadas igual que claveProfesor (sin tildes ni mayúsculas).
+function tokensBusqueda(q) {
+  return sinTildes(String(q || '')).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean).slice(0, 6);
+}
+
 const hashToken = (token) =>
   crypto.createHash('sha256').update((process.env.RESENAS_PEPPER || 'dev-pepper') + '|' + token).digest('hex');
 
@@ -220,6 +225,9 @@ class MemoryStore {
     return { estado: r.estado, reportes: r.reportes };
   }
   async pendientes() { return this.rows.filter((r) => r.estado === 'pendiente' || r.estado === 'oculta'); }
+  async buscar(tokens) {
+    return this.rows.filter((r) => tokens.every((t) => r.profesor_key.includes(t))).sort((a, b) => b.id - a.id).slice(0, 100);
+  }
   async setEstado(id, estado) {
     const r = this.rows.find((x) => x.id === id);
     if (!r) return false;
@@ -305,6 +313,12 @@ class PgStore {
   }
   async pendientes() {
     return (await this.pool.query(`SELECT * FROM resenas WHERE estado IN ('pendiente','oculta') ORDER BY id`)).rows;
+  }
+  async buscar(tokens) {
+    const cond = tokens.map((_, i) => 'profesor_key LIKE $' + (i + 1));
+    const params = tokens.map((t) => '%' + t.replace(/[%_\\]/g, '') + '%');
+    const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
+    return (await this.pool.query('SELECT * FROM resenas ' + where + ' ORDER BY id DESC LIMIT 100', params)).rows;
   }
   async setEstado(id, estado) {
     const q = await this.pool.query(
@@ -443,6 +457,11 @@ function crearApi({ store, moderar = moderarConIA, requireAdmin, limites = {} })
     const filas = await store.pendientes();
     res.json({ resenas: filas.map((r) => ({ ...publica(r), profesor: r.profesor_nombre, estado: r.estado, reportes: r.reportes, motivo: r.motivo_mod })) });
   });
+  // Busca reseñas de cualquier estado por nombre de profesor (o las más recientes si no se escribe nada).
+  admin.get('/buscar', async (req, res) => {
+    const filas = await store.buscar(tokensBusqueda(req.query.q));
+    res.json({ resenas: filas.map((r) => ({ ...publica(r), profesor: r.profesor_nombre, estado: r.estado, reportes: r.reportes, motivo: r.motivo_mod })) });
+  });
   admin.post('/:id/:accion', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const estado = { aprobar: 'publicada', rechazar: 'rechazada' }[req.params.accion];
@@ -456,24 +475,43 @@ function crearApi({ store, moderar = moderarConIA, requireAdmin, limites = {} })
 const PANEL_HTML = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Moderación de reseñas</title>
 <style>body{font:15px system-ui;max-width:760px;margin:24px auto;padding:0 14px;background:#111;color:#ddd}
-.r{border:1px solid #333;border-radius:8px;padding:12px;margin:10px 0}small{color:#888}button{margin-right:8px;padding:6px 12px;cursor:pointer}
-input{padding:6px;width:260px}</style>
-<h2>Reseñas por revisar</h2>
-<p><input id="k" type="password" placeholder="ADMIN_KEY"> <button onclick="cargar()">Cargar</button></p>
+.r{border:1px solid #333;border-radius:8px;padding:12px;margin:10px 0}.r.rechazada{opacity:.55}small{color:#888}
+button{margin-right:8px;padding:6px 12px;cursor:pointer}input{padding:6px;width:260px;max-width:100%}
+.fila{margin:8px 0}</style>
+<h2>Moderación de reseñas</h2>
+<div class="fila"><input id="k" type="password" placeholder="ADMIN_KEY"> <button id="b-pend">Ver pendientes</button></div>
+<div class="fila"><input id="q" placeholder="Buscar profesor (vacío = últimas)"> <button id="b-bus">Buscar</button></div>
 <div id="o"></div>
 <script>
-const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const H=()=>({'x-admin-key':document.getElementById('k').value});
+let modo='pend';
 async function cargar(){
-  const r=await fetch('/api/admin/resenas/pendientes',{headers:H()});
   const o=document.getElementById('o');
+  const url=modo==='pend'?'/api/admin/resenas/pendientes':'/api/admin/resenas/buscar?q='+encodeURIComponent(document.getElementById('q').value);
+  const r=await fetch(url,{headers:H()});
   if(!r.ok){o.textContent='Error '+r.status;return;}
   const {resenas}=await r.json();
-  o.innerHTML=resenas.length?resenas.map(x=>'<div class="r"><b>'+esc(x.profesor)+'</b> · ★'+x.calificacion+' · '+esc(x.estado)+
-   ' <small>('+x.reportes+' reportes'+(x.motivo?' · '+esc(x.motivo):'')+')</small><p>'+esc(x.comentario)+'</p>'+
-   '<button onclick="act('+x.id+',\\'aprobar\\')">Publicar</button><button onclick="act('+x.id+',\\'rechazar\\')">Rechazar</button></div>').join(''):'Nada por revisar 🎉';
+  if(!resenas.length){o.textContent=modo==='pend'?'Nada por revisar 🎉':'Sin resultados';return;}
+  o.innerHTML=resenas.map(x=>{
+    const botones=(x.estado==='rechazada')
+      ?'<button data-id="'+x.id+'" data-a="aprobar">Restaurar</button>'
+      :(x.estado==='publicada')
+        ?'<button data-id="'+x.id+'" data-a="rechazar">Quitar</button>'
+        :'<button data-id="'+x.id+'" data-a="aprobar">Publicar</button><button data-id="'+x.id+'" data-a="rechazar">Rechazar</button>';
+    return '<div class="r '+esc(x.estado)+'"><b>'+esc(x.profesor)+'</b> · ★'+x.calificacion+' · '+esc(x.estado)+
+      ' <small>(#'+x.id+' · '+x.reportes+' reportes'+(x.motivo?' · '+esc(x.motivo):'')+')</small><p>'+esc(x.comentario)+'</p>'+botones+'</div>';
+  }).join('');
 }
-async function act(id,a){await fetch('/api/admin/resenas/'+id+'/'+a,{method:'POST',headers:H()});cargar();}
+document.getElementById('b-pend').onclick=()=>{modo='pend';cargar();};
+document.getElementById('b-bus').onclick=()=>{modo='bus';cargar();};
+document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter'){modo='bus';cargar();}});
+document.getElementById('o').addEventListener('click',async e=>{
+  const b=e.target.closest('button[data-id]'); if(!b) return;
+  if(b.dataset.a==='rechazar'&&!confirm('¿Quitar esta reseña?')) return;
+  await fetch('/api/admin/resenas/'+b.dataset.id+'/'+b.dataset.a,{method:'POST',headers:H()});
+  cargar();
+});
 </script>`;
 
 function register(app, { requireAdmin, limites } = {}) {

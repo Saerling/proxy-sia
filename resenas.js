@@ -10,8 +10,11 @@
  *
  * Variables de entorno:
  *   DATABASE_URL        Postgres (Railway). Si falta, usa memoria (se pierde al reiniciar).
- *   ANTHROPIC_API_KEY   Activa el moderador con IA. Sin ella solo funcionan las reglas locales.
- *   MODERATION_MODEL    Modelo del moderador (por defecto claude-haiku-5-5).
+ *   GEMINI_API_KEY      Activa el moderador con IA usando Gemini (capa gratuita de Google AI Studio).
+ *   GEMINI_MODEL        Modelo de Gemini (por defecto gemini-2.5-flash-lite).
+ *   ANTHROPIC_API_KEY   Alternativa: moderador con Claude. Se usa solo si NO hay GEMINI_API_KEY.
+ *   MODERATION_MODEL    Modelo de Claude (por defecto claude-haiku-5-5).
+ *   (Sin ninguna clave de IA solo funcionan las reglas locales.)
  *   RESENAS_PEPPER      Texto secreto largo para el hash de los tokens.
  *   ADMIN_KEY           Clave para el panel /admin/resenas y las rutas de administración.
  *   PGSSL=1             Si tu Postgres exige SSL (URL pública de Railway).
@@ -113,30 +116,66 @@ function iaPermitida() {
   return ++iaVentana.n <= CFG.iaMaxPorHora;
 }
 
+function interpretarRespuestaIA(txt) {
+  const m = String(txt || '').match(/\{[\s\S]*\}/);
+  const j = m ? JSON.parse(m[0]) : null;
+  if (!j || !['aprobar', 'rechazar', 'revisar'].includes(j.decision)) return { decision: 'error', motivo: 'respuesta no válida' };
+  return { decision: j.decision, motivo: String(j.motivo || '').slice(0, 300) };
+}
+
+function mensajeUsuarioIA(comentario, profesor) {
+  return `<profesor>${String(profesor).replace(/[<>]/g, ' ')}</profesor>\n<comentario>\n${String(comentario).replace(/[<>]/g, ' ')}\n</comentario>`;
+}
+
+async function moderarConGemini({ comentario, profesor, key }) {
+  const modelo = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+  const r = await axios.post(
+    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelo)}:generateContent`,
+    {
+      systemInstruction: { parts: [{ text: PROMPT_MODERADOR }] },
+      contents: [{ role: 'user', parts: [{ text: mensajeUsuarioIA(comentario, profesor) }] }],
+      generationConfig: { temperature: 0, maxOutputTokens: 1000, responseMimeType: 'application/json' }
+    },
+    { headers: { 'x-goog-api-key': key, 'content-type': 'application/json' }, timeout: 15000 }
+  );
+  // Si Gemini bloquea el texto por sus filtros (p. ej. insultos fuertes), lo mandamos a revisión humana.
+  const bloqueo = r.data && r.data.promptFeedback && r.data.promptFeedback.blockReason;
+  const cand = r.data && r.data.candidates && r.data.candidates[0];
+  if (bloqueo || !cand || !cand.content || cand.finishReason === 'SAFETY') {
+    return { decision: 'revisar', motivo: 'Bloqueado por los filtros de la IA' + (bloqueo ? ' (' + bloqueo + ')' : '') };
+  }
+  const txt = (cand.content.parts || []).map((p) => p.text || '').join('');
+  return interpretarRespuestaIA(txt);
+}
+
+async function moderarConClaude({ comentario, profesor, key }) {
+  const r = await axios.post('https://api.anthropic.com/v1/messages', {
+    model: process.env.MODERATION_MODEL || 'claude-haiku-5-5',
+    max_tokens: 200,
+    system: PROMPT_MODERADOR,
+    messages: [{ role: 'user', content: mensajeUsuarioIA(comentario, profesor) }]
+  }, {
+    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    timeout: 10000
+  });
+  const txt = (r.data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+  return interpretarRespuestaIA(txt);
+}
+
 async function moderarConIA({ comentario, profesor }) {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) return { decision: 'sin_ia' };
+  const gemini = String(process.env.GEMINI_API_KEY || '').trim();
+  const claude = String(process.env.ANTHROPIC_API_KEY || '').trim();
+  if (!gemini && !claude) return { decision: 'sin_ia' };
   if (!iaPermitida()) return { decision: 'error', motivo: 'tope de llamadas a la IA alcanzado' };
   try {
-    const r = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: process.env.MODERATION_MODEL || 'claude-haiku-5-5',
-      max_tokens: 200,
-      system: PROMPT_MODERADOR,
-      messages: [{
-        role: 'user',
-        content: `<profesor>${String(profesor).replace(/[<>]/g, ' ')}</profesor>\n<comentario>\n${String(comentario).replace(/[<>]/g, ' ')}\n</comentario>`
-      }]
-    }, {
-      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-      timeout: 10000
-    });
-    const txt = (r.data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
-    const m = txt.match(/\{[\s\S]*\}/);
-    const j = m ? JSON.parse(m[0]) : null;
-    if (!j || !['aprobar', 'rechazar', 'revisar'].includes(j.decision)) return { decision: 'error', motivo: 'respuesta no válida' };
-    return { decision: j.decision, motivo: String(j.motivo || '').slice(0, 300) };
+    return gemini
+      ? await moderarConGemini({ comentario, profesor, key: gemini })
+      : await moderarConClaude({ comentario, profesor, key: claude });
   } catch (e) {
-    return { decision: 'error', motivo: String(e.message || e).slice(0, 200) };
+    const st = e.response && e.response.status;
+    const detalle = e.response && e.response.data && e.response.data.error && e.response.data.error.message;
+    console.error('moderación IA:', st || '', detalle || e.message);
+    return { decision: 'error', motivo: String(st === 429 ? 'límite de la IA alcanzado' : (detalle || e.message || e)).slice(0, 200) };
   }
 }
 

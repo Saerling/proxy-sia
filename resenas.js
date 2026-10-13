@@ -11,7 +11,7 @@
  * Variables de entorno:
  *   DATABASE_URL        Postgres (Railway). Si falta, usa memoria (se pierde al reiniciar).
  *   GEMINI_API_KEY      Activa el moderador con IA usando Gemini (capa gratuita de Google AI Studio).
- *   GEMINI_MODEL        Modelo de Gemini (por defecto gemini-2.5-flash-lite).
+ *   GEMINI_MODEL        Modelo de Gemini (por defecto gemini-3.5-flash-lite).
  *   ANTHROPIC_API_KEY   Alternativa: moderador con Claude. Se usa solo si NO hay GEMINI_API_KEY.
  *   MODERATION_MODEL    Modelo de Claude (por defecto claude-haiku-5-5).
  *   (Sin ninguna clave de IA solo funcionan las reglas locales.)
@@ -128,7 +128,7 @@ function mensajeUsuarioIA(comentario, profesor) {
 }
 
 async function moderarConGemini({ comentario, profesor, key }) {
-  const modelo = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+  const modelo = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
   const r = await axios.post(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelo)}:generateContent`,
     {

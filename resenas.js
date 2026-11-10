@@ -225,8 +225,17 @@ class MemoryStore {
     return { estado: r.estado, reportes: r.reportes };
   }
   async pendientes() { return this.rows.filter((r) => r.estado === 'pendiente' || r.estado === 'oculta'); }
-  async buscar(tokens) {
-    return this.rows.filter((r) => tokens.every((t) => r.profesor_key.includes(t))).sort((a, b) => b.id - a.id).slice(0, 100);
+  async buscar(tokens, f = {}) {
+    const asig = (f.asignatura || '').toLowerCase();
+    return this.rows.filter((r) => tokens.every((t) => r.profesor_key.includes(t))
+      && (!f.estado || r.estado === f.estado)
+      && (!asig || String(r.asignatura || '').toLowerCase().includes(asig))
+      && (!f.desde || new Date(r.creada || 0) >= new Date(f.desde))
+      && (!f.hasta || new Date(r.creada || 0) < new Date(f.hasta)))
+      .sort((a, b) => b.id - a.id).slice(0, 300);
+  }
+  async conteos() {
+    const c = {}; for (const r of this.rows) c[r.estado] = (c[r.estado] || 0) + 1; return c;
   }
   async setEstado(id, estado) {
     const r = this.rows.find((x) => x.id === id);
@@ -314,11 +323,20 @@ class PgStore {
   async pendientes() {
     return (await this.pool.query(`SELECT * FROM resenas WHERE estado IN ('pendiente','oculta') ORDER BY id`)).rows;
   }
-  async buscar(tokens) {
-    const cond = tokens.map((_, i) => 'profesor_key LIKE $' + (i + 1));
-    const params = tokens.map((t) => '%' + t.replace(/[%_\\]/g, '') + '%');
+  async buscar(tokens, f = {}) {
+    const cond = [], params = [];
+    const add = (sql, v) => { params.push(v); cond.push(sql.replace('?', '$' + params.length)); };
+    for (const t of tokens) add('profesor_key LIKE ?', '%' + t.replace(/[%_\\]/g, '') + '%');
+    if (f.estado) add('estado = ?', f.estado);
+    if (f.asignatura) add('asignatura ILIKE ?', '%' + f.asignatura.replace(/[%_\\]/g, '') + '%');
+    if (f.desde) add('creada >= ?', f.desde);
+    if (f.hasta) add('creada < ?', f.hasta);
     const where = cond.length ? 'WHERE ' + cond.join(' AND ') : '';
-    return (await this.pool.query('SELECT * FROM resenas ' + where + ' ORDER BY id DESC LIMIT 100', params)).rows;
+    return (await this.pool.query('SELECT * FROM resenas ' + where + ' ORDER BY id DESC LIMIT 300', params)).rows;
+  }
+  async conteos() {
+    const q = await this.pool.query('SELECT estado, count(*)::int AS n FROM resenas GROUP BY estado');
+    return Object.fromEntries(q.rows.map((r) => [r.estado, r.n]));
   }
   async setEstado(id, estado) {
     const q = await this.pool.query(
@@ -459,9 +477,18 @@ function crearApi({ store, moderar = moderarConIA, requireAdmin, limites = {} })
   });
   // Busca reseñas de cualquier estado por nombre de profesor (o las más recientes si no se escribe nada).
   admin.get('/buscar', async (req, res) => {
-    const filas = await store.buscar(tokensBusqueda(req.query.q));
+    const fecha = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : null;
+    const hasta = fecha(req.query.hasta);
+    const f = {
+      estado: ['publicada', 'pendiente', 'oculta', 'rechazada'].includes(req.query.estado) ? req.query.estado : null,
+      asignatura: String(req.query.asignatura || '').trim().slice(0, 80) || null,
+      desde: fecha(req.query.desde),
+      hasta: hasta ? new Date(new Date(hasta + 'T00:00:00Z').getTime() + 86400000).toISOString().slice(0, 10) : null,
+    };
+    const filas = await store.buscar(tokensBusqueda(req.query.q), f);
     res.json({ resenas: filas.map((r) => ({ ...publica(r), profesor: r.profesor_nombre, estado: r.estado, reportes: r.reportes, motivo: r.motivo_mod })) });
   });
+  admin.get('/conteos', async (req, res) => res.json(await store.conteos()));
   admin.post('/:id/:accion', async (req, res) => {
     const id = parseInt(req.params.id, 10);
     const estado = { aprobar: 'publicada', rechazar: 'rechazada' }[req.params.accion];
@@ -473,45 +500,77 @@ function crearApi({ store, moderar = moderarConIA, requireAdmin, limites = {} })
 }
 
 const PANEL_HTML = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Moderación de reseñas</title>
-<style>body{font:15px system-ui;max-width:760px;margin:24px auto;padding:0 14px;background:#111;color:#ddd}
-.r{border:1px solid #333;border-radius:8px;padding:12px;margin:10px 0}.r.rechazada{opacity:.55}small{color:#888}
-button{margin-right:8px;padding:6px 12px;cursor:pointer}input{padding:6px;width:260px;max-width:100%}
-.fila{margin:8px 0}</style>
+<title>Moderación de reseñas · MallaIQ</title>
+<style>
+:root{color-scheme:dark}body{font:14px/1.45 -apple-system,system-ui,sans-serif;max-width:900px;margin:0 auto;padding:20px 14px;background:#000;color:#f5f5f7}
+h2{margin:0 0 14px;letter-spacing:-.02em}input,select,button{font:inherit;border-radius:999px;border:1px solid #333;background:#161618;color:#f5f5f7;padding:7px 12px}
+button{cursor:pointer}button.pri{background:#f5f5f7;color:#000;border-color:#f5f5f7}
+.bar{display:flex;flex-wrap:wrap;gap:8px;margin:8px 0}.bar input[type=text]{flex:1 1 180px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:12px 0}.chip{padding:5px 12px;border-radius:999px;background:#161618;border:1px solid #2a2a2c;cursor:pointer;font-size:13px}.chip b{margin-left:4px}
+.chip.on{background:#f5f5f7;color:#000}
+.r{border:1px solid #2a2a2c;background:#0e0e10;border-radius:16px;padding:14px;margin:10px 0}.r.rechazada{opacity:.5}
+.r .top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.meta{color:#a1a1a6;font-size:12.5px}
+.est{font-size:12px;padding:2px 9px;border-radius:999px;background:#222}.est.publicada{background:#123d2a;color:#5fd08f}.est.pendiente{background:#3d3212;color:#f2c45a}.est.oculta{background:#3d1a12;color:#ff9f6b}.est.rechazada{background:#3d1212;color:#ff6b6b}
+p{margin:8px 0;white-space:pre-wrap}#info{color:#a1a1a6;margin:8px 0}
+</style>
 <h2>Moderación de reseñas</h2>
-<div class="fila"><input id="k" type="password" placeholder="ADMIN_KEY"> <button id="b-pend">Ver pendientes</button></div>
-<div class="fila"><input id="q" placeholder="Buscar profesor (vacío = últimas)"> <button id="b-bus">Buscar</button></div>
-<div id="o"></div>
+<div class="bar"><input id="k" type="password" placeholder="ADMIN_KEY"><button id="b-ok" class="pri">Entrar</button></div>
+<div class="chips" id="chips"></div>
+<div class="bar">
+  <input id="q" type="text" placeholder="Profesor">
+  <input id="asig" type="text" placeholder="Asignatura">
+  <select id="est"><option value="">Todos los estados</option><option>publicada</option><option>pendiente</option><option>oculta</option><option>rechazada</option></select>
+</div>
+<div class="bar"><label class="meta">Desde <input id="desde" type="date"></label><label class="meta">Hasta <input id="hasta" type="date"></label>
+  <button id="b-bus" class="pri">Buscar</button><button id="b-pend">Por revisar</button><button id="b-limpiar">Limpiar</button></div>
+<div id="info"></div><div id="o"></div>
 <script>
+const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const H=()=>({'x-admin-key':document.getElementById('k').value});
+try{$('k').value=localStorage.getItem('adm_k')||''}catch(e){}
+const H=()=>({'x-admin-key':$('k').value});
 let modo='pend';
+const fmt=d=>d?new Date(d).toLocaleString('es-CO',{dateStyle:'medium',timeStyle:'short'}):'';
+async function conteos(){
+  const r=await fetch('/api/admin/resenas/conteos',{headers:H()}); if(!r.ok) return;
+  const c=await r.json(); const tot=Object.values(c).reduce((a,b)=>a+b,0);
+  $('chips').innerHTML=['','publicada','pendiente','oculta','rechazada'].map(e=>'<span class="chip'+($('est').value===e?' on':'')+'" data-e="'+e+'">'+(e||'todas')+'<b>'+(e?(c[e]||0):tot)+'</b></span>').join('');
+}
 async function cargar(){
-  const o=document.getElementById('o');
-  const url=modo==='pend'?'/api/admin/resenas/pendientes':'/api/admin/resenas/buscar?q='+encodeURIComponent(document.getElementById('q').value);
+  const o=$('o'); o.textContent='Cargando…';
+  try{localStorage.setItem('adm_k',$('k').value)}catch(e){}
+  const p=new URLSearchParams({q:$('q').value,asignatura:$('asig').value,estado:$('est').value,desde:$('desde').value,hasta:$('hasta').value});
+  const url=modo==='pend'?'/api/admin/resenas/pendientes':'/api/admin/resenas/buscar?'+p;
   const r=await fetch(url,{headers:H()});
+  if(r.status===401||r.status===403){o.textContent='Clave incorrecta.';$('info').textContent='';return;}
   if(!r.ok){o.textContent='Error '+r.status;return;}
+  conteos();
   const {resenas}=await r.json();
+  $('info').textContent=(modo==='pend'?'Por revisar: ':'Resultados: ')+resenas.length+(resenas.length>=300?' (máx. 300, afina los filtros)':'');
   if(!resenas.length){o.textContent=modo==='pend'?'Nada por revisar 🎉':'Sin resultados';return;}
   o.innerHTML=resenas.map(x=>{
-    const botones=(x.estado==='rechazada')
-      ?'<button data-id="'+x.id+'" data-a="aprobar">Restaurar</button>'
-      :(x.estado==='publicada')
-        ?'<button data-id="'+x.id+'" data-a="rechazar">Quitar</button>'
-        :'<button data-id="'+x.id+'" data-a="aprobar">Publicar</button><button data-id="'+x.id+'" data-a="rechazar">Rechazar</button>';
-    return '<div class="r '+esc(x.estado)+'"><b>'+esc(x.profesor)+'</b> · ★'+x.calificacion+' · '+esc(x.estado)+
-      ' <small>(#'+x.id+' · '+x.reportes+' reportes'+(x.motivo?' · '+esc(x.motivo):'')+')</small><p>'+esc(x.comentario)+'</p>'+botones+'</div>';
+    const b=(x.estado==='rechazada')?'<button data-id="'+x.id+'" data-a="aprobar">Restaurar</button>'
+      :(x.estado==='publicada')?'<button data-id="'+x.id+'" data-a="rechazar">Quitar</button>'
+      :'<button class="pri" data-id="'+x.id+'" data-a="aprobar">Publicar</button> <button data-id="'+x.id+'" data-a="rechazar">Rechazar</button>';
+    return '<div class="r '+esc(x.estado)+'"><div class="top"><div><b>'+esc(x.profesor)+'</b>'+(x.asignatura?' · '+esc(x.asignatura):'')+
+      '<div class="meta">★ '+x.calificacion+(x.dificultad?' · dificultad '+x.dificultad:'')+' · '+fmt(x.fecha)+' · #'+x.id+' · '+x.reportes+' reportes'+(x.motivo?' · '+esc(x.motivo):'')+'</div></div>'+
+      '<span class="est '+esc(x.estado)+'">'+esc(x.estado)+'</span></div><p>'+esc(x.comentario)+'</p>'+b+'</div>';
   }).join('');
 }
-document.getElementById('b-pend').onclick=()=>{modo='pend';cargar();};
-document.getElementById('b-bus').onclick=()=>{modo='bus';cargar();};
-document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter'){modo='bus';cargar();}});
-document.getElementById('o').addEventListener('click',async e=>{
+$('b-ok').onclick=()=>{modo='pend';cargar();};
+$('b-pend').onclick=()=>{modo='pend';cargar();};
+$('b-bus').onclick=()=>{modo='bus';cargar();};
+$('b-limpiar').onclick=()=>{['q','asig','desde','hasta'].forEach(i=>$(i).value='');$('est').value='';modo='bus';cargar();};
+['q','asig'].forEach(i=>$(i).addEventListener('keydown',e=>{if(e.key==='Enter'){modo='bus';cargar();}}));
+['est','desde','hasta'].forEach(i=>$(i).addEventListener('change',()=>{modo='bus';cargar();}));
+$('chips').addEventListener('click',e=>{const c=e.target.closest('.chip');if(!c)return;$('est').value=c.dataset.e;modo='bus';cargar();});
+$('o').addEventListener('click',async e=>{
   const b=e.target.closest('button[data-id]'); if(!b) return;
   if(b.dataset.a==='rechazar'&&!confirm('¿Quitar esta reseña?')) return;
   await fetch('/api/admin/resenas/'+b.dataset.id+'/'+b.dataset.a,{method:'POST',headers:H()});
   cargar();
 });
+if($('k').value) cargar();
 </script>`;
 
 function register(app, { requireAdmin, limites } = {}) {

@@ -49,6 +49,7 @@ function tokensBusqueda(q) {
   return sinTildes(String(q || '')).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(Boolean).slice(0, 6);
 }
 
+if (!process.env.RESENAS_PEPPER) console.warn('[resenas] Falta RESENAS_PEPPER: los identificadores se resumen con un valor de prueba.');
 const hashToken = (token) =>
   crypto.createHash('sha256').update((process.env.RESENAS_PEPPER || 'dev-pepper') + '|' + token).digest('hex');
 
@@ -275,7 +276,12 @@ class PgStore {
         resena_id BIGINT NOT NULL REFERENCES resenas(id) ON DELETE CASCADE,
         token_hash TEXT NOT NULL,
         PRIMARY KEY (resena_id, token_hash)
-      );`);
+      );
+      -- 4. Row-Level Security: solo el dueño (este servidor) lee y escribe; cualquier otro rol no ve nada.
+      ALTER TABLE profesores ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE resenas ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE resenas_reportes ENABLE ROW LEVEL SECURITY;
+      REVOKE ALL ON profesores, resenas, resenas_reportes FROM PUBLIC;`);
   }
   async conocerProfesores(lista) {
     if (!lista.length) return;
@@ -527,7 +533,7 @@ p{margin:8px 0;white-space:pre-wrap}#info{color:#a1a1a6;margin:8px 0}
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-try{$('k').value=localStorage.getItem('adm_k')||''}catch(e){}
+try{$('k').value=sessionStorage.getItem('adm_k')||''}catch(e){}
 const H=()=>({'x-admin-key':$('k').value});
 let modo='pend';
 const fmt=d=>d?new Date(d).toLocaleString('es-CO',{dateStyle:'medium',timeStyle:'short'}):'';
@@ -538,7 +544,7 @@ async function conteos(){
 }
 async function cargar(){
   const o=$('o'); o.textContent='Cargando…';
-  try{localStorage.setItem('adm_k',$('k').value)}catch(e){}
+  try{sessionStorage.setItem('adm_k',$('k').value)}catch(e){}
   const p=new URLSearchParams({q:$('q').value,asignatura:$('asig').value,estado:$('est').value,desde:$('desde').value,hasta:$('hasta').value});
   const url=modo==='pend'?'/api/admin/resenas/pendientes':'/api/admin/resenas/buscar?'+p;
   const r=await fetch(url,{headers:H()});
@@ -584,7 +590,7 @@ function register(app, { requireAdmin, limites } = {}) {
 
   app.use('/api/resenas', enLinea, api.router);
   app.use('/api/admin/resenas', enLinea, api.admin);
-  app.get('/admin/resenas', (req, res) => res.type('html').send(PANEL_HTML));
+  app.get('/admin/resenas', (req, res) => { res.set('Cache-Control', 'no-store'); res.type('html').send(PANEL_HTML); });
   return { registrarDesdeCatalogo: (body) => listo.then((ok) => ok && api.registrarDesdeCatalogo(body)) };
 }
 

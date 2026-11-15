@@ -5,25 +5,40 @@ const { CookieJar } = require('tough-cookie');
 const puppeteer = require('puppeteer');
 const crypto = require('crypto');
 
-const app = express();
-app.set('trust proxy', 1); // Railway va detrás de un proxy: así req.ip es la IP real (solo para límites en memoria)
+const seguridad = require('./seguridad');
 
-// CORS: define ALLOWED_ORIGINS en Railway con el dominio de tu página (varios, separados por coma).
-// Si no la defines, queda abierto a cualquier origen (como antes).
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
-app.use(cors(ALLOWED_ORIGINS.length ? { origin: ALLOWED_ORIGINS } : undefined));
+const app = express();
+app.set('trust proxy', 1); // Render va detrás de un proxy: así req.ip es la IP real (solo para límites en memoria)
+app.disable('x-powered-by');
+
+// 19. HTTPS obligatorio y 18. cabeceras de seguridad en todas las respuestas.
+app.use(seguridad.forzarHttps);
+app.use(seguridad.cabeceras);
+
+// CORS: solo las páginas de Mallas. ALLOWED_ORIGINS (separados por coma) reemplaza la lista por defecto.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || seguridad.ORIGENES_POR_DEFECTO.join(','))
+    .split(',').map((s) => s.trim()).filter(Boolean);
+app.use(cors({ origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'], maxAge: 600 }));
 app.use(express.json({ limit: '20kb' }));
 
+// 11. Límite general por IP para toda la API (las rutas sensibles tienen además el suyo).
+app.use('/api', seguridad.limitador(300, 10 * 60e3, 'api'));
+
 // Protege las rutas internas/de depuración y el panel de moderación.
-// Envía la clave en la cabecera x-admin-key (o ?key=... para probar desde el navegador).
+// La clave va SOLO en la cabecera x-admin-key (nunca en la URL, que queda en registros e historial).
+// 10 intentos fallidos por IP bloquean esa IP 15 minutos.
+const _fallosAdmin = seguridad.contadorFallos(10, 15 * 60e3);
 function requireAdmin(req, res, next) {
     const esperado = process.env.ADMIN_KEY;
     if (!esperado) return res.status(503).json({ error: 'ADMIN_KEY no está configurada en el servidor.' });
-    const dado = String(req.get('x-admin-key') || req.query.key || '');
+    if (_fallosAdmin.bloqueada(req.ip)) return res.status(429).json({ error: 'Demasiados intentos. Prueba más tarde.' });
+    const dado = String(req.get('x-admin-key') || '');
     const h = (x) => crypto.createHash('sha256').update(x).digest();
-    if (!crypto.timingSafeEqual(h(dado), h(esperado))) return res.status(401).json({ error: 'No autorizado.' });
+    if (!crypto.timingSafeEqual(h(dado), h(esperado))) { _fallosAdmin.fallo(req.ip); return res.status(401).json({ error: 'No autorizado.' }); }
+    _fallosAdmin.limpiar(req.ip);
     next();
 }
+app.locals.requireAdmin = requireAdmin;
 
 app.get('/', (req, res) => {
     res.send('¡Mi proxy está funcionando!');
@@ -710,6 +725,8 @@ app.use('/api/catalogo/grupos', (req, res, next) => {
     next();
 });
 
+// El catálogo consulta el SIA en vivo (caro): límite propio más estricto.
+app.use('/api/catalogo', seguridad.limitador(120, 10 * 60e3, 'catalogo'));
 require('./catalogo').register(app);
 // ==========================================
 // COMENTARIOS PRIVADOS (llegan solo al dueño, por Telegram)
@@ -736,9 +753,10 @@ app.post('/api/comentarios', async (req, res) => {
         if (hits.length >= 5) return res.status(429).json({ ok: false, error: 'Demasiados mensajes' });
 
         const b = req.body || {};
+        if (b.web) return res.json({ ok: true }); // 12. honeypot: campo oculto que solo llenan los bots
         const tipo = _fbTipos.includes(b.tipo) ? b.tipo : 'Comentario';
-        const mensaje = String(b.mensaje || '').trim().slice(0, 1000);
-        const contacto = String(b.contacto || '').trim().slice(0, 80);
+        const mensaje = seguridad.textoLimpio(b.mensaje, 1000);
+        const contacto = seguridad.textoLimpio(b.contacto, 80);
         if (mensaje.length < 10) return res.status(400).json({ ok: false, error: 'Mensaje muy corto' });
 
         hits.push(ahora);

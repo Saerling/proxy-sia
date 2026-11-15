@@ -707,13 +707,27 @@ function createCatalogo({ transportFactory = createHttpTransport } = {}) {
 // ---------------------------------------------------------------------------
 function register(app, opts) {
   const cat = createCatalogo(opts);
-  const readF = (q) => ({ nivel: q.nivel, sede: q.sede, facultad: q.facultad, plan: q.plan, tipologia: q.tipologia });
+  // 14. Validar: cada filtro es un texto corto de letras, números, espacios, puntos o guiones (o no viene).
+  const PARAM = /^[A-Za-z0-9ÁÉÍÓÚÑáéíóúñ ._-]{1,60}$/;
+  const p = (v) => {
+    if (v == null || v === '') return undefined;
+    if (typeof v !== 'string' || !PARAM.test(v)) throw httpError(400, 'Parámetro no válido.');
+    return v;
+  };
+  const readF = (q) => ({ nivel: p(q.nivel), sede: p(q.sede), facultad: p(q.facultad), plan: p(q.plan), tipologia: p(q.tipologia) });
   const need = (f, ...ks) => {
     const miss = ks.filter((k) => !f[k]);
     if (miss.length) throw httpError(400, `Faltan parámetros: ${miss.join(', ')}. Usa /api/catalogo/opciones para ver los valores válidos.`);
   };
+  // 17. Solo lo necesario: la traza interna y el HTML del SIA solo salen con la clave de administrador.
+  const esAdmin = (req) => {
+    const k = process.env.ADMIN_KEY; const dado = String(req.get('x-admin-key') || '');
+    if (!k || !dado) return false;
+    const h = (x) => require('crypto').createHash('sha256').update(x).digest();
+    return require('crypto').timingSafeEqual(h(dado), h(k));
+  };
   const wrap = (fn) => async (req, res) => {
-    const debug = req.query.debug === '1';
+    const debug = req.query.debug === '1' && esAdmin(req);
     try {
       const data = await fn(req);
       if (!debug && data && typeof data === 'object') {
@@ -722,8 +736,11 @@ function register(app, opts) {
       }
       res.json({ generadoEn: new Date().toISOString(), ...data });
     } catch (e) {
-      res.status(e.status || 502).json({
-        generadoEn: new Date().toISOString(), error: e.message, opciones: e.opciones, preview: e.preview
+      const status = e.status || 502;
+      res.status(status).json({
+        generadoEn: new Date().toISOString(),
+        error: status < 500 ? e.message : 'No se pudo consultar el SIA. Intenta más tarde.',
+        opciones: e.opciones, ...(debug ? { preview: e.preview, detalle: e.message } : {})
       });
     }
   };
@@ -736,7 +753,7 @@ function register(app, opts) {
     const f = readF(req.query);
     need(f, 'sede', 'facultad', 'plan');
     const r = await cat.getAsignaturas(f);
-    const q = req.query.q ? norm(req.query.q) : null;
+    const q = typeof req.query.q === 'string' && req.query.q ? norm(req.query.q.slice(0, 80)) : null;
     const courses = q ? r.courses.filter((c) => norm(c.nombre).includes(q) || norm(c.codigo).includes(q)) : r.courses;
     return { seleccion: r.seleccion, total: r.rowCount, devueltas: courses.length, cached: r.cached, asignaturas: courses, trace: r.trace };
   }));
@@ -744,13 +761,13 @@ function register(app, opts) {
   // ---- Libre elección --------------------------------------------------------------------------
   // modo=facultad (por defecto): ?sede=1101&facultad=2000   -> todas las de esa sede/facultad (en Bogotá: la sede completa)
   // modo=plan:                   ?plan=2CLE                 -> un componente (2CLE, 4CLE, ...). /libre/opciones?modo=plan los lista.
-  const readL = (q) => ({ modo: q.modo, plan: q.plan, sede: q.sede, facultad: q.facultad, todos: q.todos === '1' });
+  const readL = (q) => ({ modo: p(q.modo), plan: p(q.plan), sede: p(q.sede), facultad: p(q.facultad), todos: q.todos === '1' });
 
   app.get('/api/catalogo/libre/opciones', wrap(async (req) => cat.getLibreOpciones(readL(req.query))));
 
   app.get('/api/catalogo/libre', wrap(async (req) => {
     const r = await cat.getAsignaturas(readL(req.query), { libre: true });
-    const q = req.query.q ? norm(req.query.q) : null;
+    const q = typeof req.query.q === 'string' && req.query.q ? norm(req.query.q.slice(0, 80)) : null;
     const courses = q ? r.courses.filter((c) => norm(c.nombre).includes(q) || norm(c.codigo).includes(q)) : r.courses;
     return {
       seleccion: r.seleccion, filasSia: r.filas, unicas: r.courses.length, repetidas: r.filas - r.courses.length,
@@ -760,6 +777,7 @@ function register(app, opts) {
 
   app.get('/api/catalogo/libre/grupos', wrap(async (req) => {
     const codigos = String(req.query.codigos || req.query.codigo || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (codigos.some((c) => !/^[A-Za-z0-9-]{1,20}$/.test(c))) throw httpError(400, 'Código no válido.');
     if (!codigos.length) throw httpError(400, 'Falta ?codigo= (o ?codigos=A,B,C).');
     if (codigos.length > 8) throw httpError(400, 'Máximo 8 códigos por petición.');
     return { resultados: await cat.getGrupos(readL(req.query), codigos, { libre: true }) };
@@ -770,6 +788,7 @@ function register(app, opts) {
     const f = readF(req.query);
     need(f, 'sede', 'facultad', 'plan');
     const codigos = String(req.query.codigos || req.query.codigo || '').split(',').map((s) => s.trim()).filter(Boolean);
+    if (codigos.some((c) => !/^[A-Za-z0-9-]{1,20}$/.test(c))) throw httpError(400, 'Código no válido.');
     if (!codigos.length) throw httpError(400, 'Falta ?codigo= (o ?codigos=A,B,C).');
     if (codigos.length > 8) throw httpError(400, 'Máximo 8 códigos por petición.');
     const resultados = await cat.getGrupos(f, codigos);
